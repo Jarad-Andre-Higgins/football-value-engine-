@@ -11,3 +11,4 @@ data/processed/*
 models/*
 logs/*
 !.gitkeep
+data/sample/*.csv

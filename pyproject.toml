@@ -1,0 +1,12 @@
+# Tool configuration only. Dependencies live in requirements*.txt.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.mypy]
+warn_unused_ignores = true
+
+# pandas, scipy and matplotlib ship no type information, so mypy treats them as Any.
+[[tool.mypy.overrides]]
+module = ["pandas.*", "scipy.*", "matplotlib.*"]
+ignore_missing_imports = true

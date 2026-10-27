@@ -1,0 +1,172 @@
+# Canonical team registry: one entry per club. This file is the project's source of truth
+# for team identity, so it lives in Git and every change is reviewed.
+#
+#   id       stable ASCII slug. Never rename it once data has been built on it.
+#   name     the display name shown in logs and Telegram coupons.
+#   country  used to scope matching, so two clubs in different countries may share a spelling.
+#   aliases  every other spelling seen in a data source or bookmaker. Case, accents,
+#            punctuation and tokens like "FC" are ignored when matching.
+#
+# Rules: a spelling may belong to only one team per country. Never add a vague alias such as
+# "Real", "Union" or "Racing"; the loader refuses ambiguous spellings. When the audit
+# (python -m src.entities) reports an unknown spelling, add it here by hand.
+
+teams:
+  # --- England ---
+  - {id: arsenal, country: England, name: "Arsenal", aliases: ["Arsenal FC"]}
+  - {id: aston-villa, country: England, name: "Aston Villa", aliases: ["Villa", "Aston Villa FC"]}
+  - {id: bournemouth, country: England, name: "Bournemouth", aliases: ["AFC Bournemouth"]}
+  - {id: brentford, country: England, name: "Brentford", aliases: ["Brentford FC"]}
+  - {id: brighton, country: England, name: "Brighton & Hove Albion", aliases: ["Brighton", "Brighton Hove Albion", "Brighton & Hove"]}
+  - {id: burnley, country: England, name: "Burnley", aliases: ["Burnley FC"]}
+  - {id: chelsea, country: England, name: "Chelsea", aliases: ["Chelsea FC"]}
+  - {id: coventry, country: England, name: "Coventry City", aliases: ["Coventry"]}
+  - {id: crystal-palace, country: England, name: "Crystal Palace", aliases: ["Palace", "Crystal Palace FC"]}
+  - {id: everton, country: England, name: "Everton", aliases: ["Everton FC"]}
+  - {id: fulham, country: England, name: "Fulham", aliases: ["Fulham FC"]}
+  - {id: hull, country: England, name: "Hull City", aliases: ["Hull"]}
+  - {id: ipswich, country: England, name: "Ipswich Town", aliases: ["Ipswich"]}
+  - {id: leeds, country: England, name: "Leeds United", aliases: ["Leeds", "Leeds Utd"]}
+  - {id: leicester, country: England, name: "Leicester City", aliases: ["Leicester"]}
+  - {id: liverpool, country: England, name: "Liverpool", aliases: ["Liverpool FC"]}
+  - {id: luton, country: England, name: "Luton Town", aliases: ["Luton"]}
+  - {id: manchester-city, country: England, name: "Manchester City", aliases: ["Man City", "Man. City", "Manchester City FC"]}
+  - {id: manchester-united, country: England, name: "Manchester United", aliases: ["Man United", "Man Utd", "Man. United", "Manchester Utd", "Manchester United FC"]}
+  - {id: newcastle, country: England, name: "Newcastle United", aliases: ["Newcastle", "Newcastle Utd"]}
+  - {id: norwich, country: England, name: "Norwich City", aliases: ["Norwich"]}
+  - {id: nottingham-forest, country: England, name: "Nottingham Forest", aliases: ["Nott'm Forest", "Nottm Forest", "Nottingham Forest FC"]}
+  - {id: sheffield-united, country: England, name: "Sheffield United", aliases: ["Sheffield Utd"]}
+  - {id: southampton, country: England, name: "Southampton", aliases: ["Southampton FC"]}
+  - {id: sunderland, country: England, name: "Sunderland", aliases: ["Sunderland AFC"]}
+  - {id: tottenham, country: England, name: "Tottenham Hotspur", aliases: ["Tottenham", "Spurs", "Tottenham Hotspur FC"]}
+  - {id: watford, country: England, name: "Watford", aliases: ["Watford FC"]}
+  - {id: west-brom, country: England, name: "West Bromwich Albion", aliases: ["West Brom", "West Bromwich"]}
+  - {id: west-ham, country: England, name: "West Ham United", aliases: ["West Ham", "West Ham Utd"]}
+  - {id: wolves, country: England, name: "Wolverhampton Wanderers", aliases: ["Wolves", "Wolverhampton"]}
+
+  # --- Spain ---
+  - {id: alaves, country: Spain, name: "Deportivo Alavés", aliases: ["Alaves", "Deportivo Alaves"]}
+  - {id: almeria, country: Spain, name: "Almería", aliases: ["Almeria", "UD Almeria"]}
+  - {id: athletic-club, country: Spain, name: "Athletic Club", aliases: ["Ath Bilbao", "Athletic Bilbao", "Ath. Bilbao"]}
+  - {id: atletico-madrid, country: Spain, name: "Atlético Madrid", aliases: ["Ath Madrid", "Atletico Madrid", "Atlético de Madrid", "Atl. Madrid"]}
+  - {id: barcelona, country: Spain, name: "Barcelona", aliases: ["FC Barcelona", "Barca", "Barça"]}
+  - {id: betis, country: Spain, name: "Real Betis", aliases: ["Betis", "Real Betis Balompie"]}
+  - {id: cadiz, country: Spain, name: "Cádiz", aliases: ["Cadiz", "Cadiz CF"]}
+  - {id: celta, country: Spain, name: "Celta Vigo", aliases: ["Celta", "Celta de Vigo", "RC Celta"]}
+  - {id: deportivo, country: Spain, name: "Deportivo La Coruña", aliases: ["La Coruna", "Deportivo La Coruna", "Deportivo de La Coruna", "Depor", "RC Deportivo"]}
+  - {id: eibar, country: Spain, name: "Eibar", aliases: ["SD Eibar"]}
+  - {id: elche, country: Spain, name: "Elche", aliases: ["Elche CF"]}
+  - {id: espanyol, country: Spain, name: "Espanyol", aliases: ["Espanol", "RCD Espanyol"]}
+  - {id: getafe, country: Spain, name: "Getafe", aliases: ["Getafe CF"]}
+  - {id: girona, country: Spain, name: "Girona", aliases: ["Girona FC"]}
+  - {id: granada, country: Spain, name: "Granada", aliases: ["Granada CF"]}
+  - {id: huesca, country: Spain, name: "Huesca", aliases: ["SD Huesca"]}
+  - {id: las-palmas, country: Spain, name: "Las Palmas", aliases: ["UD Las Palmas"]}
+  - {id: leganes, country: Spain, name: "Leganés", aliases: ["Leganes", "CD Leganes"]}
+  - {id: levante, country: Spain, name: "Levante", aliases: ["Levante UD"]}
+  - {id: malaga, country: Spain, name: "Málaga", aliases: ["Malaga", "Malaga CF"]}
+  - {id: mallorca, country: Spain, name: "Mallorca", aliases: ["RCD Mallorca", "Real Mallorca"]}
+  - {id: osasuna, country: Spain, name: "Osasuna", aliases: ["CA Osasuna"]}
+  - {id: oviedo, country: Spain, name: "Real Oviedo", aliases: ["Oviedo"]}
+  - {id: racing-santander, country: Spain, name: "Racing Santander", aliases: ["Santander", "Racing de Santander"]}
+  - {id: rayo-vallecano, country: Spain, name: "Rayo Vallecano", aliases: ["Vallecano", "Rayo"]}
+  - {id: real-madrid, country: Spain, name: "Real Madrid", aliases: ["Real Madrid CF"]}
+  - {id: real-sociedad, country: Spain, name: "Real Sociedad", aliases: ["Sociedad"]}
+  - {id: sevilla, country: Spain, name: "Sevilla", aliases: ["Sevilla FC"]}
+  - {id: valencia, country: Spain, name: "Valencia", aliases: ["Valencia CF"]}
+  - {id: valladolid, country: Spain, name: "Real Valladolid", aliases: ["Valladolid"]}
+  - {id: villarreal, country: Spain, name: "Villarreal", aliases: ["Villarreal CF"]}
+
+  # --- Italy ---
+  - {id: atalanta, country: Italy, name: "Atalanta", aliases: ["Atalanta BC"]}
+  - {id: benevento, country: Italy, name: "Benevento", aliases: ["Benevento Calcio"]}
+  - {id: bologna, country: Italy, name: "Bologna", aliases: ["Bologna FC"]}
+  - {id: brescia, country: Italy, name: "Brescia", aliases: ["Brescia Calcio"]}
+  - {id: cagliari, country: Italy, name: "Cagliari", aliases: ["Cagliari Calcio"]}
+  - {id: como, country: Italy, name: "Como", aliases: ["Como 1907"]}
+  - {id: cremonese, country: Italy, name: "Cremonese", aliases: ["US Cremonese"]}
+  - {id: crotone, country: Italy, name: "Crotone", aliases: ["FC Crotone"]}
+  - {id: empoli, country: Italy, name: "Empoli", aliases: ["Empoli FC"]}
+  - {id: fiorentina, country: Italy, name: "Fiorentina", aliases: ["ACF Fiorentina"]}
+  - {id: frosinone, country: Italy, name: "Frosinone", aliases: ["Frosinone Calcio"]}
+  - {id: genoa, country: Italy, name: "Genoa", aliases: ["Genoa CFC"]}
+  - {id: inter, country: Italy, name: "Inter Milan", aliases: ["Inter", "Internazionale", "FC Internazionale", "Inter Milano"]}
+  - {id: juventus, country: Italy, name: "Juventus", aliases: ["Juve", "Juventus FC"]}
+  - {id: lazio, country: Italy, name: "Lazio", aliases: ["SS Lazio"]}
+  - {id: lecce, country: Italy, name: "Lecce", aliases: ["US Lecce"]}
+  - {id: milan, country: Italy, name: "AC Milan", aliases: ["Milan", "A.C. Milan"]}
+  - {id: monza, country: Italy, name: "Monza", aliases: ["AC Monza"]}
+  - {id: napoli, country: Italy, name: "Napoli", aliases: ["SSC Napoli"]}
+  - {id: parma, country: Italy, name: "Parma", aliases: ["Parma Calcio", "Parma Calcio 1913"]}
+  - {id: pisa, country: Italy, name: "Pisa", aliases: ["Pisa SC"]}
+  - {id: roma, country: Italy, name: "AS Roma", aliases: ["Roma", "A.S. Roma"]}
+  - {id: salernitana, country: Italy, name: "Salernitana", aliases: ["US Salernitana"]}
+  - {id: sampdoria, country: Italy, name: "Sampdoria", aliases: ["UC Sampdoria"]}
+  - {id: sassuolo, country: Italy, name: "Sassuolo", aliases: ["US Sassuolo"]}
+  - {id: spal, country: Italy, name: "SPAL", aliases: ["SPAL 2013"]}
+  - {id: spezia, country: Italy, name: "Spezia", aliases: ["Spezia Calcio"]}
+  - {id: torino, country: Italy, name: "Torino", aliases: ["Torino FC"]}
+  - {id: udinese, country: Italy, name: "Udinese", aliases: ["Udinese Calcio"]}
+  - {id: venezia, country: Italy, name: "Venezia", aliases: ["Venezia FC"]}
+  - {id: verona, country: Italy, name: "Hellas Verona", aliases: ["Verona", "Hellas Verona FC"]}
+
+  # --- Germany ---
+  - {id: arminia-bielefeld, country: Germany, name: "Arminia Bielefeld", aliases: ["Bielefeld"]}
+  - {id: augsburg, country: Germany, name: "FC Augsburg", aliases: ["Augsburg"]}
+  - {id: bayern-munich, country: Germany, name: "Bayern Munich", aliases: ["Bayern München", "Bayern Munchen", "FC Bayern München", "Bayern"]}
+  - {id: bochum, country: Germany, name: "VfL Bochum", aliases: ["Bochum", "VfL Bochum 1848"]}
+  - {id: darmstadt, country: Germany, name: "Darmstadt 98", aliases: ["Darmstadt", "SV Darmstadt 98"]}
+  - {id: dortmund, country: Germany, name: "Borussia Dortmund", aliases: ["Dortmund", "BVB", "B. Dortmund"]}
+  - {id: eintracht-frankfurt, country: Germany, name: "Eintracht Frankfurt", aliases: ["Ein Frankfurt", "E. Frankfurt"]}
+  - {id: elversberg, country: Germany, name: "SV Elversberg", aliases: ["Elversberg", "SV 07 Elversberg"]}
+  - {id: fortuna-dusseldorf, country: Germany, name: "Fortuna Düsseldorf", aliases: ["Fortuna Dusseldorf", "Fortuna Duesseldorf", "Dusseldorf"]}
+  - {id: freiburg, country: Germany, name: "SC Freiburg", aliases: ["Freiburg"]}
+  - {id: gladbach, country: Germany, name: "Borussia Mönchengladbach", aliases: ["M'gladbach", "Monchengladbach", "Gladbach", "Borussia Monchengladbach", "Borussia M.Gladbach"]}
+  - {id: greuther-furth, country: Germany, name: "Greuther Fürth", aliases: ["Greuther Furth", "SpVgg Greuther Furth", "Greuther Fuerth"]}
+  - {id: hamburg, country: Germany, name: "Hamburger SV", aliases: ["Hamburg", "HSV"]}
+  - {id: heidenheim, country: Germany, name: "1. FC Heidenheim", aliases: ["Heidenheim", "FC Heidenheim"]}
+  - {id: hertha, country: Germany, name: "Hertha BSC", aliases: ["Hertha", "Hertha Berlin"]}
+  - {id: hoffenheim, country: Germany, name: "TSG Hoffenheim", aliases: ["Hoffenheim", "TSG 1899 Hoffenheim"]}
+  - {id: holstein-kiel, country: Germany, name: "Holstein Kiel", aliases: ["Kiel"]}
+  - {id: koln, country: Germany, name: "1. FC Köln", aliases: ["FC Koln", "Koln", "Köln", "Cologne", "FC Cologne"]}
+  - {id: leverkusen, country: Germany, name: "Bayer Leverkusen", aliases: ["Leverkusen", "Bayer 04 Leverkusen"]}
+  - {id: mainz, country: Germany, name: "Mainz 05", aliases: ["Mainz", "FSV Mainz 05", "1. FSV Mainz 05"]}
+  - {id: paderborn, country: Germany, name: "SC Paderborn 07", aliases: ["Paderborn"]}
+  - {id: rb-leipzig, country: Germany, name: "RB Leipzig", aliases: ["Leipzig", "RasenBallsport Leipzig"]}
+  - {id: schalke, country: Germany, name: "Schalke 04", aliases: ["Schalke", "FC Schalke 04"]}
+  - {id: st-pauli, country: Germany, name: "FC St. Pauli", aliases: ["St Pauli", "St. Pauli", "FC St Pauli"]}
+  - {id: stuttgart, country: Germany, name: "VfB Stuttgart", aliases: ["Stuttgart"]}
+  - {id: union-berlin, country: Germany, name: "Union Berlin", aliases: ["1. FC Union Berlin"]}
+  - {id: werder-bremen, country: Germany, name: "Werder Bremen", aliases: ["Bremen", "SV Werder Bremen"]}
+  - {id: wolfsburg, country: Germany, name: "VfL Wolfsburg", aliases: ["Wolfsburg"]}
+
+  # --- France ---
+  - {id: ajaccio, country: France, name: "AC Ajaccio", aliases: ["Ajaccio"]}
+  - {id: amiens, country: France, name: "Amiens", aliases: ["Amiens SC"]}
+  - {id: angers, country: France, name: "Angers", aliases: ["Angers SCO"]}
+  - {id: auxerre, country: France, name: "Auxerre", aliases: ["AJ Auxerre"]}
+  - {id: bordeaux, country: France, name: "Bordeaux", aliases: ["Girondins Bordeaux", "FC Girondins de Bordeaux"]}
+  - {id: brest, country: France, name: "Brest", aliases: ["Stade Brestois", "Stade Brestois 29"]}
+  - {id: clermont, country: France, name: "Clermont Foot", aliases: ["Clermont", "Clermont Foot 63"]}
+  - {id: dijon, country: France, name: "Dijon", aliases: ["Dijon FCO"]}
+  - {id: le-havre, country: France, name: "Le Havre", aliases: ["Le Havre AC"]}
+  - {id: le-mans, country: France, name: "Le Mans", aliases: ["Le Mans FC"]}
+  - {id: lens, country: France, name: "RC Lens", aliases: ["Lens", "Racing Club de Lens"]}
+  - {id: lille, country: France, name: "Lille", aliases: ["Lille OSC", "LOSC Lille", "LOSC"]}
+  - {id: lorient, country: France, name: "Lorient", aliases: ["FC Lorient"]}
+  - {id: lyon, country: France, name: "Olympique Lyonnais", aliases: ["Lyon", "Olympique Lyon", "OL"]}
+  - {id: marseille, country: France, name: "Olympique de Marseille", aliases: ["Marseille", "Olympique Marseille", "OM"]}
+  - {id: metz, country: France, name: "Metz", aliases: ["FC Metz"]}
+  - {id: monaco, country: France, name: "AS Monaco", aliases: ["Monaco"]}
+  - {id: montpellier, country: France, name: "Montpellier", aliases: ["Montpellier HSC"]}
+  - {id: nantes, country: France, name: "FC Nantes", aliases: ["Nantes"]}
+  - {id: nice, country: France, name: "OGC Nice", aliases: ["Nice"]}
+  - {id: nimes, country: France, name: "Nîmes", aliases: ["Nimes", "Nimes Olympique"]}
+  - {id: paris-fc, country: France, name: "Paris FC", aliases: []}
+  - {id: paris-saint-germain, country: France, name: "Paris Saint-Germain", aliases: ["Paris SG", "PSG", "Paris Saint Germain"]}
+  - {id: reims, country: France, name: "Reims", aliases: ["Stade de Reims", "Stade Reims"]}
+  - {id: rennes, country: France, name: "Rennes", aliases: ["Stade Rennais", "Stade Rennais FC"]}
+  - {id: st-etienne, country: France, name: "Saint-Étienne", aliases: ["St Etienne", "AS Saint-Etienne", "Saint Etienne", "St. Etienne"]}
+  - {id: strasbourg, country: France, name: "Strasbourg", aliases: ["RC Strasbourg", "Racing Strasbourg", "RC Strasbourg Alsace"]}
+  - {id: toulouse, country: France, name: "Toulouse", aliases: ["Toulouse FC"]}
+  - {id: troyes, country: France, name: "Troyes", aliases: ["ESTAC Troyes"]}

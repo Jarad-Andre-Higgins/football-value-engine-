@@ -11,23 +11,34 @@ without downloading again.
 Be a good guest: this is an unofficial endpoint, used here for personal
 research. Do not hammer it and do not redistribute the data.
 
+When Understat is down it answers every request with a web page instead of data
+(a "We will come back soon" maintenance page was seen in November 2026). The
+downloader says what the page is, and stops after a few failures in a row
+instead of trying every file. Finished files stay cached, so run it again later.
+Files saved elsewhere, such as an earlier notebook's output or a private Kaggle
+dataset (loose files or zip archives), can be restored with ``--import-from``.
+
 Usage::
 
     python -m src.understat                  # five leagues, 2019/20 to now
     python -m src.understat --peek E0 2025   # show the structure of a saved file
+    python -m src.understat --import-from /kaggle/input/understat-cache
 """
 
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import logging
 import os
 import re
 import sys
 import time
+import zipfile
 from collections import Counter
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
 from typing import Any, Final, Self
@@ -83,6 +94,39 @@ XG_COLUMNS: Final[tuple[str, ...]] = (
 # --------------------------------------------------------------------------- #
 # Downloading
 # --------------------------------------------------------------------------- #
+NOT_JSON: Final[str] = "response is not JSON"
+#: Phrases (lower case) that mean "the site is down" on a page that should have been data.
+_MAINTENANCE_PHRASES: Final[tuple[str, ...]] = (
+    "back soon",
+    "under maintenance",
+    "maintenance mode",
+    "scheduled maintenance",
+    "temporarily unavailable",
+)
+#: Phrases that mean a firewall or bot check answered instead of the site.
+_FIREWALL_PHRASES: Final[tuple[str, ...]] = (
+    "just a moment",
+    "attention required",
+    "checking your browser",
+    "verify you are human",
+    "captcha",
+    "access denied",
+)
+_SCAN_LIMIT: Final[int] = 2_000_000  # bytes of a response read to explain it
+_SPACES: Final[re.Pattern[str]] = re.compile(r"\s+")
+_TAG: Final[re.Pattern[str]] = re.compile(r"<[^>]*>")
+#: Parts of a page that are not text a person reads (the title is read separately).
+_CODE_BLOCK: Final[re.Pattern[str]] = re.compile(
+    r"<(script|style|head|title)\b.*?</\1\s*>", re.IGNORECASE | re.DOTALL
+)
+_TITLE: Final[re.Pattern[str]] = re.compile(
+    r"<title[^>]*>(.*?)</title\s*>", re.IGNORECASE | re.DOTALL
+)
+_HTML_START: Final[re.Pattern[bytes]] = re.compile(
+    rb"<(!doctype|html|head|body)\b", re.IGNORECASE
+)
+
+
 def payload_problem(content: bytes) -> str | None:
     """Return why ``content`` is not a usable league payload, or ``None`` if it is.
 
@@ -92,13 +136,77 @@ def payload_problem(content: bytes) -> str | None:
     try:
         payload = json.loads(content)
     except ValueError:
-        return "response is not JSON (has the endpoint changed?)"
+        return f"{NOT_JSON} (has the endpoint changed?)"
     if not isinstance(payload, dict) or not {"teams", "dates"} <= payload.keys():
         keys = sorted(payload) if isinstance(payload, dict) else type(payload).__name__
         return f"unexpected payload shape (keys: {keys})"
     if not isinstance(payload["dates"], list) or not payload["dates"]:
         return "payload has no fixtures"
     return None
+
+
+def _squash(text: str) -> str:
+    """Unescape HTML entities and collapse all white space to single spaces."""
+    return _SPACES.sub(" ", html.unescape(text)).strip()
+
+
+def describe_response(status: int, headers: Mapping[str, str], content: bytes) -> str:
+    """Say what a response that is not usable data actually is.
+
+    "Not JSON" alone cannot tell a site that is down from one that blocks this
+    machine or one that moved its endpoint. The answer is in the page that came
+    back, so this reads it.
+
+    Args:
+        status: HTTP status code.
+        headers: Response headers.
+        content: Response body.
+
+    Returns:
+        One sentence, such as ``Understat is showing a maintenance page ("We will
+        come back soon"): the site is down, so try again later``.
+    """
+    if not content.strip():
+        return "the response is empty"
+    raw = content[:_SCAN_LIMIT].decode("utf-8", errors="replace")
+    found = _TITLE.search(raw)
+    title = _squash(found.group(1)) if found else ""
+    words = _squash(_TAG.sub(" ", _CODE_BLOCK.sub(" ", raw)))
+    lowered = f"{title} {words}".lower()
+    if any(phrase in lowered for phrase in _MAINTENANCE_PHRASES):
+        return (
+            f'Understat is showing a maintenance page ("{(words or title)[:60]}"): '
+            "the site is down, so try again later"
+        )
+    behind_cloudflare = any(name.lower() == "cf-ray" for name in headers)
+    if any(phrase in lowered for phrase in _FIREWALL_PHRASES) or (
+        status == 403 and behind_cloudflare
+    ):
+        return (
+            "a firewall or bot-check page answered instead of Understat; "
+            "this machine may be blocked"
+        )
+    if status >= 500:
+        return "the server answered with an error, so the site may be down"
+    if _HTML_START.search(content[:2048]):
+        shown = f'title "{title[:60]}"' if title else f'text "{words[:60]}"'
+        return (
+            f"a web page came back instead of data ({shown}); has the endpoint changed?"
+        )
+    return (
+        f"the response is not data (it starts with {content[:30]!r}); "
+        "has the endpoint changed?"
+    )
+
+
+def unusable_reason(
+    content: bytes, status: int = 200, headers: Mapping[str, str] | None = None
+) -> str | None:
+    """Like :func:`payload_problem`, but says what a non-JSON response actually is."""
+    problem = payload_problem(content)
+    if problem is not None and problem.startswith(NOT_JSON):
+        return f"{NOT_JSON}: {describe_response(status, headers or {}, content)}"
+    return problem
 
 
 class UnderstatDownloader:
@@ -188,16 +296,17 @@ class UnderstatDownloader:
             return FetchResult(league, season, FetchStatus.FAILED, detail=detail)
         if response.status_code == 404:
             return FetchResult(league, season, FetchStatus.MISSING)
+        status, headers, body = response.status_code, response.headers, response.content
         if not response.ok:
+            why = describe_response(status, headers, body)
             return FetchResult(
-                league,
-                season,
-                FetchStatus.FAILED,
-                detail=f"HTTP {response.status_code}",
+                league, season, FetchStatus.FAILED, detail=f"HTTP {status}: {why}"
             )
-        problem = payload_problem(response.content)
+        problem = unusable_reason(body, status, headers)
         if problem is not None:
-            return FetchResult(league, season, FetchStatus.FAILED, detail=problem)
+            kind = headers.get("Content-Type", "no content type").split(";")[0].strip()
+            detail = f"{problem} [HTTP {status}, {kind}, {len(body):,} bytes]"
+            return FetchResult(league, season, FetchStatus.FAILED, detail=detail)
 
         path.parent.mkdir(parents=True, exist_ok=True)
         temp = path.with_name(path.name + ".part")
@@ -218,11 +327,31 @@ class UnderstatDownloader:
         *,
         current_season: int,
         force: bool = False,
+        max_failures: int = 3,
     ) -> list[FetchResult]:
-        """Fetch every league-season combination and log each outcome."""
-        season_list = list(seasons)
+        """Fetch every league-season combination and log each outcome.
+
+        When ``max_failures`` requests fail in a row the run stops, because a site
+        that is down or blocking this machine fails every file the same way and
+        trying the rest only wastes time. Files served from the cache do not count
+        either way, and any answer from the site (a download or a 404) resets the
+        count.
+
+        Args:
+            leagues: football-data division codes.
+            seasons: Season start years.
+            current_season: The season in progress, which is always refreshed.
+            force: Re-download files already on disk.
+            max_failures: Stop after this many failures in a row (0 never stops).
+
+        Returns:
+            One result for each file that was tried, in order. A run that stopped
+            early returns fewer results than there are files.
+        """
+        league_list, season_list = list(leagues), list(seasons)
         results: list[FetchResult] = []
-        for league in leagues:
+        in_a_row = 0
+        for league in league_list:
             for season in season_list:
                 result = self.fetch(
                     league, season, current_season=current_season, force=force
@@ -230,6 +359,7 @@ class UnderstatDownloader:
                 label = f"{league} {season_label(season)}"
                 if result.status is FetchStatus.FAILED:
                     logger.error("%s: FAILED - %s", label, result.detail)
+                    in_a_row += 1
                 elif result.status is FetchStatus.MISSING:
                     logger.warning("%s: not published (HTTP 404)", label)
                 else:
@@ -238,7 +368,21 @@ class UnderstatDownloader:
                         label,
                         f"{result.status.value} {result.detail}".strip(),
                     )
+                if result.status in (FetchStatus.DOWNLOADED, FetchStatus.MISSING):
+                    in_a_row = 0
                 results.append(result)
+                if max_failures and in_a_row >= max_failures:
+                    untried = len(league_list) * len(season_list) - len(results)
+                    if untried:
+                        logger.error(
+                            "Stopping after %d failures in a row; %d files were not "
+                            "tried. Understat is probably down or not reachable from "
+                            "this machine. Finished files are cached, so run the "
+                            "command again later.",
+                            in_a_row,
+                            untried,
+                        )
+                    return results
         return results
 
 
@@ -377,6 +521,98 @@ def read_league_file(path: Path) -> pd.DataFrame:
     return parse_league_payload(payload, league, season)
 
 
+@dataclass(frozen=True)
+class ImportReport:
+    """What :func:`import_files` did.
+
+    Attributes:
+        imported: Names of the files copied into the raw folder.
+        present: Names of valid files that were already there and were kept.
+        rejected: File name -> why it was refused, for files with an Understat
+            name that are not usable data, and zip archives that cannot be read.
+        ignored: Number of other ``.json`` files skipped because their names are
+            not those of Understat league files.
+    """
+
+    imported: tuple[str, ...]
+    present: tuple[str, ...]
+    rejected: dict[str, str]
+    ignored: int
+
+
+def _zip_members(path: Path) -> list[tuple[str, bytes]]:
+    """The ``.json`` files inside a zip archive, as ``(file name, content)``.
+
+    Raises:
+        zipfile.BadZipFile: If ``path`` is not a readable zip archive.
+    """
+    with zipfile.ZipFile(path) as archive:
+        return [
+            (Path(member.filename).name, archive.read(member))
+            for member in archive.infolist()
+            if not member.is_dir() and member.filename.lower().endswith(".json")
+        ]
+
+
+def import_files(
+    source: Path, raw_dir: Path = UNDERSTAT_DIR, *, force: bool = False
+) -> ImportReport:
+    """Copy saved Understat league files from ``source`` into ``raw_dir``.
+
+    This restores a cache made elsewhere: an earlier notebook's output, a private
+    Kaggle dataset, or a computer that could reach Understat when this one could
+    not. Each file is checked as a download would be, so a saved error page never
+    gets in. Sub-folders of ``source`` are searched, ``.zip`` archives are opened,
+    and files already in ``raw_dir`` are kept unless ``force`` is set.
+
+    Raises:
+        FileNotFoundError: If ``source`` does not exist.
+        NotADirectoryError: If ``source`` is not a folder.
+    """
+    if not source.exists():
+        raise FileNotFoundError(f"{source} does not exist")
+    if not source.is_dir():
+        raise NotADirectoryError(f"{source} is not a folder")
+    imported: list[str] = []
+    present: list[str] = []
+    rejected: dict[str, str] = {}
+    ignored = 0
+    for path in sorted(source.rglob("*")):
+        if not path.is_file():
+            continue
+        suffix = path.suffix.lower()
+        if suffix == ".json":
+            found = [(path.name, path.read_bytes())]
+        elif suffix == ".zip":
+            try:
+                found = _zip_members(path)
+            except zipfile.BadZipFile:
+                rejected[path.name] = "not a readable zip archive"
+                continue
+        else:
+            continue
+        for name, content in found:
+            try:
+                parse_file_name(Path(name))
+            except ValueError:
+                ignored += 1
+                continue
+            problem = unusable_reason(content)
+            if problem is not None:
+                rejected[name] = problem
+                continue
+            target = raw_dir / name
+            if target.exists() and not force:
+                present.append(name)
+                continue
+            raw_dir.mkdir(parents=True, exist_ok=True)
+            temp = target.with_name(target.name + ".part")
+            temp.write_bytes(content)
+            os.replace(temp, target)
+            imported.append(name)
+    return ImportReport(tuple(imported), tuple(present), rejected, ignored)
+
+
 def describe_file(path: Path) -> str:
     """Summarise a saved file's structure, for diagnosing format changes."""
     payload = json.loads(path.read_bytes())
@@ -411,24 +647,68 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--delay", type=float, default=1.0, help="seconds between requests"
     )
+    parser.add_argument(
+        "--max-failures",
+        type=int,
+        default=3,
+        help="stop after this many failed downloads in a row (0: never stop)",
+    )
     parser.add_argument("--raw-dir", type=Path, default=UNDERSTAT_DIR)
     parser.add_argument("--base-url", default=BASE_URL)
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--peek",
         nargs=2,
         metavar=("LEAGUE", "SEASON"),
         help="show the structure of an already downloaded file, e.g. --peek E0 2025",
     )
+    mode.add_argument(
+        "--import-from",
+        type=Path,
+        metavar="DIR",
+        help="copy saved league files (E0_2526.json ..., or zip archives of them) "
+        "from DIR into the raw folder",
+    )
     args = parser.parse_args(argv)
     if args.to_season is not None and args.to_season < args.from_season:
         parser.error("--to-season must not be earlier than --from-season")
+    if args.max_failures < 0:
+        parser.error("--max-failures cannot be negative")
     return args
 
 
+def _run_import(source: Path, raw_dir: Path, force: bool, log: logging.Logger) -> int:
+    """Restore saved files with :func:`import_files` and report; return the exit code."""
+    try:
+        report = import_files(source, raw_dir, force=force)
+    except OSError as exc:
+        log.error("Cannot import from %s: %s", source, exc)
+        return 1
+    for name, reason in report.rejected.items():
+        log.error("%s: rejected - %s", name, reason)
+    log.info(
+        "Import from %s: imported=%d already_present=%d rejected=%d other_json_ignored=%d",
+        source,
+        len(report.imported),
+        len(report.present),
+        len(report.rejected),
+        report.ignored,
+    )
+    if not (report.imported or report.present or report.rejected):
+        log.error(
+            "No Understat league files found in %s (expected names like E0_2526.json)",
+            source,
+        )
+        return 1
+    return 1 if report.rejected else 0
+
+
 def main(argv: list[str] | None = None) -> int:
-    """Download (or ``--peek`` at) Understat files; return the process exit code."""
+    """Download, ``--peek`` at or ``--import-from`` Understat files; return the exit code."""
     args = _parse_args(argv)
     log = setup_logging("understat")
+    if args.import_from:
+        return _run_import(args.import_from, args.raw_dir, args.force, log)
     if args.peek:
         league, season = args.peek[0], int(args.peek[1])
         path = args.raw_dir / f"{league}_{season_code(season)}.json"
@@ -454,16 +734,19 @@ def main(argv: list[str] | None = None) -> int:
             range(args.from_season, last + 1),
             current_season=current,
             force=args.force,
+            max_failures=args.max_failures,
         )
     counts = Counter(result.status for result in results)
+    not_tried = len(args.leagues) * (last - args.from_season + 1) - len(results)
     log.info(
-        "Understat finished: downloaded=%d cached=%d missing=%d failed=%d",
+        "Understat finished: downloaded=%d cached=%d missing=%d failed=%d not_tried=%d",
         counts[FetchStatus.DOWNLOADED],
         counts[FetchStatus.CACHED],
         counts[FetchStatus.MISSING],
         counts[FetchStatus.FAILED],
+        not_tried,
     )
-    return 1 if counts[FetchStatus.FAILED] else 0
+    return 1 if counts[FetchStatus.FAILED] else 0  # an early stop always has failures
 
 
 if __name__ == "__main__":

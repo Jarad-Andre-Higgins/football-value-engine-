@@ -6,6 +6,7 @@ import json
 import logging
 import sys
 import threading
+import zipfile
 from collections.abc import Iterator
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -22,11 +23,14 @@ from src.understat import (
     XG_COLUMNS,
     UnderstatDownloader,
     describe_file,
+    describe_response,
+    import_files,
     main,
     parse_file_name,
     parse_league_payload,
     payload_problem,
     read_league_file,
+    unusable_reason,
 )
 
 ENGLISH = ("Arsenal", "Chelsea", "Liverpool", "Everton")
@@ -216,6 +220,94 @@ def test_payload_problem_accepts_a_real_shape() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Saying what a bad response is (Understat's "We will come back soon" page)
+# --------------------------------------------------------------------------- #
+MAINTENANCE = (
+    b"<!DOCTYPE html><html><head><title>Understat</title>"
+    b"<style>body { background: #333; }</style></head>"
+    b'<body><script>var note = "just a moment";</script>'
+    b"<h1>We will come back soon</h1></body></html>"
+)
+
+
+@pytest.mark.parametrize(
+    ("status", "headers", "content", "fragments"),
+    [
+        (
+            200,
+            {},
+            MAINTENANCE,
+            ["maintenance page", '"We will come back soon"', "try again later"],
+        ),
+        (
+            200,
+            {},
+            b"<html><head><title>Site under maintenance</title></head><body><img></body></html>",
+            ["maintenance page", '"Site under maintenance"'],  # only the title says so
+        ),
+        (
+            200,
+            {},
+            b"<html><title>Just a moment...</title><body>Checking your browser</body></html>",
+            ["firewall or bot-check"],
+        ),
+        (
+            403,
+            {"CF-RAY": "8a1b"},
+            b"<html><body>Forbidden</body></html>",
+            ["firewall or bot-check"],
+        ),
+        (
+            200,
+            {"CF-RAY": "8a1b"},
+            b"<html><head><title>Understat</title></head><body>Hello</body></html>",
+            ['title "Understat"', "endpoint changed"],
+        ),
+        (502, {}, b"<html><body>Bad gateway</body></html>", ["site may be down"]),
+        (
+            200,
+            {},
+            b"<html><head><title> EPL\n  table </title></head></html>",
+            ['title "EPL table"'],
+        ),
+        (
+            200,
+            {},
+            b"<html><body><script>var a = 'back soon';</script><p>Hello there</p></body></html>",
+            ['text "Hello there"', "endpoint changed"],  # script text is not page text
+        ),
+        (200, {}, b"  \n", ["the response is empty"]),
+        (200, {}, b"\x1f\x8bgarbage", ["not data", "\\x1f\\x8b", "endpoint changed"]),
+    ],
+)
+def test_describe_response_says_what_came_back(
+    status: int, headers: dict[str, str], content: bytes, fragments: list[str]
+) -> None:
+    text = describe_response(status, headers, content)
+    for fragment in fragments:
+        assert fragment in text, (fragment, text)
+
+
+def test_words_inside_scripts_and_styles_are_not_mistaken_for_the_page() -> None:
+    page = (
+        b"<html><head><style>.back-soon { color: red }</style></head><body>"
+        b"<script>var a = 'just a moment, back soon';</script><p>Hello there</p>"
+        b"</body></html>"
+    )
+    text = describe_response(200, {}, page)
+    assert "maintenance" not in text and "firewall" not in text
+    assert 'text "Hello there"' in text
+
+
+def test_unusable_reason_explains_only_what_is_not_json() -> None:
+    assert unusable_reason(encode(make_payload())) is None
+    assert unusable_reason(b'{"teams": {}}') == payload_problem(b'{"teams": {}}')
+    reason = unusable_reason(MAINTENANCE)
+    assert reason is not None
+    assert reason.startswith("response is not JSON: Understat is showing a maintenance")
+
+
+# --------------------------------------------------------------------------- #
 # Downloading (a fake server that, like Understat, 404s without the header)
 # --------------------------------------------------------------------------- #
 @dataclass
@@ -235,8 +327,9 @@ def server() -> Iterator[FakeServer]:
             hits.append(self.path)
             if self.headers.get("X-Requested-With") != "XMLHttpRequest":
                 status, body = 404, b"not found"
-            else:
-                status, body = routes.get(self.path, (404, b"not found"))
+            else:  # "*" is the answer for every path that has no route of its own
+                fallback = routes.get("*", (404, b"not found"))
+                status, body = routes.get(self.path, fallback)
             self.send_response(status)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -345,6 +438,233 @@ def test_wrong_shape_and_server_errors_are_failures(
     assert server.hits.count("/getLeagueData/EPL/2024") == 2  # one retry
 
 
+def test_a_maintenance_page_is_reported_as_what_it_is(
+    server: FakeServer, tmp_path: Path
+) -> None:
+    server.routes["/getLeagueData/EPL/2025"] = (200, MAINTENANCE)
+    with make_downloader(server, tmp_path) as downloader:
+        result = downloader.fetch("E0", 2025, current_season=2026)
+    assert result.status is FetchStatus.FAILED
+    assert result.detail.startswith("response is not JSON: Understat is showing")
+    assert '"We will come back soon"' in result.detail
+    assert result.detail.endswith(
+        f"[HTTP 200, no content type, {len(MAINTENANCE)} bytes]"
+    )
+    assert not list(tmp_path.iterdir())
+
+
+def test_a_blocked_request_says_so_and_keeps_its_status(
+    server: FakeServer, tmp_path: Path
+) -> None:
+    page = b"<html><title>Just a moment...</title><body>Checking your browser</body></html>"
+    server.routes["/getLeagueData/EPL/2025"] = (403, page)
+    with make_downloader(server, tmp_path) as downloader:
+        result = downloader.fetch("E0", 2025, current_season=2026)
+    assert result.status is FetchStatus.FAILED
+    assert result.detail.startswith("HTTP 403: a firewall or bot-check page")
+    assert not list(tmp_path.iterdir())
+
+
+# --------------------------------------------------------------------------- #
+# Stopping when the site is down
+# --------------------------------------------------------------------------- #
+def test_the_run_stops_after_three_failures_in_a_row(
+    server: FakeServer, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    server.routes["*"] = (200, MAINTENANCE)
+    with (
+        make_downloader(server, tmp_path) as downloader,
+        caplog.at_level(logging.ERROR, logger="src.understat"),
+    ):
+        results = downloader.download_all(
+            ["E0", "SP1"], [2019, 2020, 2021], current_season=2026
+        )
+    assert [r.status for r in results] == [FetchStatus.FAILED] * 3
+    assert len(server.hits) == 3  # three of the six files were tried
+    assert "Stopping after 3 failures in a row; 3 files were not tried" in caplog.text
+    assert not list(tmp_path.iterdir())
+
+
+def test_a_limit_of_zero_never_stops(server: FakeServer, tmp_path: Path) -> None:
+    server.routes["*"] = (200, MAINTENANCE)
+    with make_downloader(server, tmp_path) as downloader:
+        results = downloader.download_all(
+            ["E0", "SP1"], [2019, 2020, 2021], current_season=2026, max_failures=0
+        )
+    assert len(results) == 6 and len(server.hits) == 6
+
+
+def test_the_limit_is_configurable(server: FakeServer, tmp_path: Path) -> None:
+    server.routes["*"] = (200, MAINTENANCE)
+    with make_downloader(server, tmp_path) as downloader:
+        results = downloader.download_all(
+            ["E0"], [2019, 2020, 2021, 2022], current_season=2026, max_failures=2
+        )
+    assert len(results) == 2 and len(server.hits) == 2
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [(200, encode(make_payload())), (404, b"not found")],
+    ids=["a download", "a 404"],
+)
+def test_any_answer_from_the_site_resets_the_count(
+    server: FakeServer, tmp_path: Path, answer: tuple[int, bytes]
+) -> None:
+    server.routes["*"] = (200, MAINTENANCE)
+    server.routes["/getLeagueData/EPL/2021"] = answer
+    with make_downloader(server, tmp_path) as downloader:
+        results = downloader.download_all(
+            ["E0"], [2019, 2020, 2021, 2022, 2023], current_season=2026
+        )
+    assert len(results) == 5 and len(server.hits) == 5  # two, a reset, two: never three
+
+
+def test_cached_files_neither_count_nor_reset(
+    server: FakeServer, tmp_path: Path
+) -> None:
+    (tmp_path / "E0_2021.json").write_bytes(encode(make_payload()))  # season 2020
+    server.routes["*"] = (200, MAINTENANCE)
+    with make_downloader(server, tmp_path) as downloader:
+        results = downloader.download_all(
+            ["E0"], [2019, 2020, 2021, 2022, 2023, 2024], current_season=2026
+        )
+    statuses = [r.status for r in results]
+    assert statuses == [
+        FetchStatus.FAILED,
+        FetchStatus.CACHED,
+        FetchStatus.FAILED,
+        FetchStatus.FAILED,
+    ]
+    assert len(server.hits) == 3
+
+
+def test_no_stop_message_when_the_last_file_trips_the_limit(
+    server: FakeServer, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    server.routes["*"] = (200, MAINTENANCE)
+    with (
+        make_downloader(server, tmp_path) as downloader,
+        caplog.at_level(logging.ERROR, logger="src.understat"),
+    ):
+        results = downloader.download_all(
+            ["E0"], [2019, 2020, 2021], current_season=2026
+        )
+    assert len(results) == 3 and "Stopping after" not in caplog.text
+
+
+# --------------------------------------------------------------------------- #
+# Restoring a cache made elsewhere
+# --------------------------------------------------------------------------- #
+def write_saved_cache(source: Path) -> bytes:
+    """A folder as an earlier session or a Kaggle dataset would leave it."""
+    good = encode(make_payload())
+    (source / "nested").mkdir(parents=True)
+    (source / "E0_2526.json").write_bytes(good)
+    (source / "nested" / "SP1_2425.json").write_bytes(good)
+    (source / "E0_2425.json").write_bytes(MAINTENANCE)  # an error page saved by mistake
+    (source / "dataset-metadata.json").write_text("{}", encoding="utf-8")
+    (source / "notes.txt").write_text("not data", encoding="utf-8")
+    return good
+
+
+def test_import_copies_valid_files_and_reports_the_rest(tmp_path: Path) -> None:
+    source, raw = tmp_path / "source", tmp_path / "raw"
+    good = write_saved_cache(source)
+    report = import_files(source, raw)
+    assert sorted(report.imported) == ["E0_2526.json", "SP1_2425.json"]
+    assert report.present == ()
+    assert list(report.rejected) == ["E0_2425.json"]
+    assert report.rejected["E0_2425.json"].startswith(
+        "response is not JSON: Understat is showing a maintenance page"
+    )
+    assert report.ignored == 1  # dataset-metadata.json
+    assert sorted(p.name for p in raw.iterdir()) == ["E0_2526.json", "SP1_2425.json"]
+    assert (raw / "E0_2526.json").read_bytes() == good
+
+
+def test_import_keeps_files_already_present_unless_forced(tmp_path: Path) -> None:
+    source, raw = tmp_path / "source", tmp_path / "raw"
+    write_saved_cache(source)
+    import_files(source, raw)
+    newer = encode(make_payload(start="2025-08-09"))
+    (source / "E0_2526.json").write_bytes(newer)
+    kept = import_files(source, raw)
+    assert kept.imported == () and sorted(kept.present) == [
+        "E0_2526.json",
+        "SP1_2425.json",
+    ]
+    assert (raw / "E0_2526.json").read_bytes() != newer
+    forced = import_files(source, raw, force=True)
+    assert sorted(forced.imported) == ["E0_2526.json", "SP1_2425.json"]
+    assert (raw / "E0_2526.json").read_bytes() == newer
+    assert not list(raw.glob("*.part"))
+
+
+def make_zip(path: Path, members: dict[str, bytes]) -> None:
+    with zipfile.ZipFile(path, "w") as archive:
+        for name, content in members.items():
+            archive.writestr(name, content)
+
+
+def test_import_opens_zip_archives_like_folders(tmp_path: Path) -> None:
+    source, raw = tmp_path / "source", tmp_path / "raw"
+    source.mkdir()
+    good = encode(make_payload())
+    make_zip(
+        source / "understat_cache.zip",
+        {
+            "data/raw/understat/E0_2526.json": good,  # folders inside the zip do not matter
+            "data/raw/understat/SP1_2425.json": good,
+            "data/raw/understat/E0_2425.json": MAINTENANCE,
+            "data/raw/understat/dataset-metadata.json": b"{}",
+            "data/raw/understat/readme.txt": b"not json",
+        },
+    )
+    report = import_files(source, raw)
+    assert sorted(report.imported) == ["E0_2526.json", "SP1_2425.json"]
+    assert list(report.rejected) == ["E0_2425.json"] and report.ignored == 1
+    assert (raw / "E0_2526.json").read_bytes() == good
+    assert sorted(p.name for p in raw.iterdir()) == ["E0_2526.json", "SP1_2425.json"]
+
+
+def test_import_reports_an_unreadable_zip_and_keeps_going(tmp_path: Path) -> None:
+    source, raw = tmp_path / "source", tmp_path / "raw"
+    source.mkdir()
+    (source / "broken.zip").write_bytes(b"this is not a zip archive")
+    (source / "E0_2526.json").write_bytes(encode(make_payload()))
+    report = import_files(source, raw)
+    assert report.rejected == {"broken.zip": "not a readable zip archive"}
+    assert report.imported == ("E0_2526.json",)
+
+
+def test_the_same_file_in_a_folder_and_a_zip_is_imported_once(tmp_path: Path) -> None:
+    source, raw = tmp_path / "source", tmp_path / "raw"
+    source.mkdir()
+    good = encode(make_payload())
+    (source / "E0_2526.json").write_bytes(good)
+    make_zip(source / "again.zip", {"E0_2526.json": good})
+    report = import_files(source, raw)
+    assert report.imported == ("E0_2526.json",) and report.present == ("E0_2526.json",)
+
+
+def test_import_needs_a_folder_that_exists(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError, match="does not exist"):
+        import_files(tmp_path / "nowhere", tmp_path / "raw")
+    (tmp_path / "file.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(NotADirectoryError, match="not a folder"):
+        import_files(tmp_path / "file.json", tmp_path / "raw")
+    assert not (tmp_path / "raw").exists()
+
+
+def test_imported_files_read_like_downloaded_ones(tmp_path: Path) -> None:
+    source, raw = tmp_path / "source", tmp_path / "raw"
+    write_saved_cache(source)
+    import_files(source, raw)
+    frame = read_league_file(raw / "E0_2526.json")
+    assert list(frame.columns) == list(XG_COLUMNS) and len(frame) > 0
+
+
 # --------------------------------------------------------------------------- #
 # Command line
 # --------------------------------------------------------------------------- #
@@ -389,4 +709,84 @@ def test_cli_rejects_a_reversed_season_range(
     args[args.index("--to-season") + 1] = "2020"
     with pytest.raises(SystemExit) as excinfo:
         main(args)
+    assert excinfo.value.code == 2
+
+
+@pytest.mark.usefixtures("isolated_logging")
+def test_cli_stops_early_when_the_site_is_down(
+    server: FakeServer, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    server.routes["*"] = (200, MAINTENANCE)
+    args = [*cli_args(server, tmp_path / "raw"), "--from-season", "2019"]
+    with caplog.at_level(logging.INFO):
+        assert main(args) == 1
+    assert len(server.hits) == 3  # seven seasons were asked for
+    assert "failed=3 not_tried=4" in caplog.text
+    assert "Stopping after 3 failures in a row; 4 files were not tried" in caplog.text
+    assert not (tmp_path / "raw").exists()
+
+
+@pytest.mark.usefixtures("isolated_logging")
+def test_cli_max_failures_zero_tries_everything(
+    server: FakeServer, tmp_path: Path
+) -> None:
+    server.routes["*"] = (200, MAINTENANCE)
+    args = [*cli_args(server, tmp_path / "raw"), "--from-season", "2019"]
+    assert main([*args, "--max-failures", "0"]) == 1
+    assert len(server.hits) == 7
+
+
+def test_cli_rejects_a_negative_failure_limit(
+    server: FakeServer, tmp_path: Path
+) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        main([*cli_args(server, tmp_path), "--max-failures", "-1"])
+    assert excinfo.value.code == 2
+
+
+@pytest.mark.usefixtures("isolated_logging")
+def test_cli_import_from_restores_a_clean_cache(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    source, raw = tmp_path / "source", tmp_path / "raw"
+    source.mkdir()
+    (source / "E0_2526.json").write_bytes(encode(make_payload()))
+    with caplog.at_level(logging.INFO):
+        assert main(["--import-from", str(source), "--raw-dir", str(raw)]) == 0
+    assert "imported=1 already_present=0 rejected=0 other_json_ignored=0" in caplog.text
+    assert (raw / "E0_2526.json").exists()
+    assert main(["--import-from", str(source), "--raw-dir", str(raw)]) == 0  # again
+
+
+@pytest.mark.usefixtures("isolated_logging")
+def test_cli_import_from_fails_when_a_file_is_refused_but_keeps_the_good_ones(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    source, raw = tmp_path / "source", tmp_path / "raw"
+    write_saved_cache(source)
+    with caplog.at_level(logging.INFO):
+        assert main(["--import-from", str(source), "--raw-dir", str(raw)]) == 1
+    assert "E0_2425.json: rejected - response is not JSON" in caplog.text
+    assert (raw / "E0_2526.json").exists() and not (raw / "E0_2425.json").exists()
+
+
+@pytest.mark.usefixtures("isolated_logging")
+def test_cli_import_from_needs_something_to_import(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    empty, raw = tmp_path / "empty", tmp_path / "raw"
+    empty.mkdir()
+    with caplog.at_level(logging.ERROR):
+        assert main(["--import-from", str(empty), "--raw-dir", str(raw)]) == 1
+        assert "No Understat league files found" in caplog.text
+        caplog.clear()
+        assert (
+            main(["--import-from", str(tmp_path / "gone"), "--raw-dir", str(raw)]) == 1
+        )
+        assert "Cannot import from" in caplog.text
+
+
+def test_cli_import_from_cannot_be_combined_with_peek(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--import-from", str(tmp_path), "--peek", "E0", "2025"])
     assert excinfo.value.code == 2

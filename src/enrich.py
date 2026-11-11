@@ -7,9 +7,15 @@ home/away pair: each ordered pair meets once per league-season, so no date
 matching (and no time-zone trouble) is needed. The two sources must then agree
 on the score of nearly every match, which is the proof the join is right.
 
+When Understat is unavailable, ``--xg-source shots`` fills the same columns with
+a proxy priced from football-data's shot counts (see :mod:`src.xg_proxy`). It
+needs neither the Understat files nor the team registry, and it marks every row
+``xg_source = "shots_proxy"`` so nobody mistakes it for real xG.
+
 Usage::
 
-    python -m src.enrich
+    python -m src.enrich                      # real xG from the saved Understat files
+    python -m src.enrich --xg-source shots    # fallback: shot-based proxy
 """
 
 from __future__ import annotations
@@ -36,6 +42,7 @@ from src.pipeline import (
     resolve_teams,
 )
 from src.understat import UNDERSTAT_DIR, XG_COLUMNS, read_league_file
+from src.xg_proxy import ShotModel, fit_shot_model, shot_xg, xg_per_goal
 
 logger = logging.getLogger("src.enrich")
 
@@ -56,6 +63,7 @@ EXTRA_COLUMNS: Final[list[str]] = [
 MAX_SCORE_DISAGREEMENT: Final[float] = 0.01  # above this share, the join is suspect
 MAX_DATE_GAP_DAYS: Final[int] = 3
 MAX_PLAUSIBLE_XG: Final[float] = 8.0
+SHOT_PROXY_SOURCE: Final[str] = "shots_proxy"
 
 
 def build_xg_table(raw_dir: Path, registry: TeamRegistry) -> pd.DataFrame:
@@ -187,6 +195,78 @@ def xg_coverage(enriched: pd.DataFrame) -> pd.DataFrame:
     return coverage
 
 
+def enrich_with_shots(matches: pd.DataFrame) -> tuple[pd.DataFrame, ShotModel]:
+    """Add a shot-based xG proxy in place of Understat's, with the same columns.
+
+    The proxy fills ``home_xg`` and ``away_xg``. The Understat-only columns
+    (``understat_id``, non-penalty xG, PPDA and deep completions) stay empty, and
+    ``xg_source`` records where the xG came from.
+
+    Args:
+        matches: The unified match table from ``python -m src.pipeline``.
+
+    Returns:
+        The enriched table (``matches``, then :data:`EXTRA_COLUMNS`, then
+        ``xg_source``) and the fitted shot prices.
+
+    Raises:
+        ValueError: If the shot data cannot support the calibration (see
+            :func:`src.xg_proxy.fit_shot_model`).
+    """
+    model = fit_shot_model(matches)
+    proxy = shot_xg(matches, model)
+    extra = {
+        column: proxy[column] if column in proxy.columns else float("nan")
+        for column in EXTRA_COLUMNS
+    }
+    return matches.assign(**extra, xg_source=SHOT_PROXY_SOURCE), model
+
+
+def _run_shots(args: argparse.Namespace, log: logging.Logger) -> int:
+    """Write ``matches_enriched.parquet`` with the shot-based proxy; return the exit code."""
+    if not args.matches.exists():
+        log.error(
+            "Match table not found: %s; run python -m src.pipeline first", args.matches
+        )
+        return 1
+    matches = pd.read_parquet(args.matches)
+    try:
+        enriched, model = enrich_with_shots(matches)
+    except ValueError as exc:
+        log.error("Cannot build the shot-based xG proxy: %s", exc)
+        return 1
+    log.warning(
+        "FALLBACK in use: xG is a shot-based proxy, NOT Understat xG. Prices fitted on "
+        "%s (%d team-matches): %.3f goals per shot on target, %.3f per other shot. "
+        "Rebuild without --xg-source shots once Understat data is available.",
+        season_label(model.season),
+        model.n_observations,
+        model.on_target,
+        model.off_target,
+    )
+    unpriced = enriched["home_xg"].isna() | enriched["away_xg"].isna()
+    if unpriced.any():
+        by_season = enriched[unpriced].groupby("season").size().to_dict()
+        log.warning(
+            "%d of %d matches have no shot data, so no xG proxy (by season: %s)",
+            int(unpriced.sum()),
+            len(enriched),
+            by_season,
+        )
+    log.info(
+        "Proxy xG per actual goal, by season (near 1.0 is well calibrated):\n%s",
+        xg_per_goal(enriched).to_string(float_format="{:.2f}".format),
+    )
+    log.info(
+        "xG coverage by season (%% of matches):\n%s",
+        xg_coverage(enriched).to_string(float_format="{:.0f}".format),
+    )
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    enriched.to_parquet(args.output, index=False)
+    log.info("Wrote %s", args.output)
+    return 0
+
+
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Merge Understat xG into the match table."
@@ -196,6 +276,13 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--registry", type=Path, default=DEFAULT_REGISTRY_PATH)
     parser.add_argument("--xg-output", type=Path, default=XG_OUTPUT)
     parser.add_argument("--output", type=Path, default=ENRICHED_OUTPUT)
+    parser.add_argument(
+        "--xg-source",
+        choices=("understat", "shots"),
+        default="understat",
+        help="understat: real xG from the saved Understat files; shots: a proxy "
+        "priced from football-data shot counts, for when Understat is unavailable",
+    )
     return parser.parse_args(argv)
 
 
@@ -203,10 +290,12 @@ def main(argv: list[str] | None = None) -> int:
     """Build ``matches_enriched.parquet`` and return the process exit code.
 
     Returns ``0`` on success, ``1`` when data is missing, unresolved or fails
-    validation, and ``2`` when the team registry is missing.
+    validation, and ``2`` when the team registry is missing (Understat mode only).
     """
     args = _parse_args(argv)
     log = setup_logging("enrich")
+    if args.xg_source == "shots":
+        return _run_shots(args, log)
     if not args.registry.exists():
         log.error("Registry not found: %s", args.registry)
         return 2

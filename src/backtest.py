@@ -17,6 +17,13 @@ Nothing in a decision may use information from after the decision:
 * **The reference price** is the sharp book's early price with its margin removed.
 * **Results and the closing price** are read only after the bets are placed.
 
+The sharp book's margin is taken out of both its early price (the reference) and
+its closing price (the yardstick). How that is done is a choice that moves both
+the bets selected and the closing-line value measured: ``proportional`` scaling
+trusts a long shot's price as much as a favourite's, and the ``power`` and
+``shin`` methods do not. ``python -m src.margin_audit`` compares them on the
+results and ``--demargin`` picks one.
+
 A strategy is a bookmaker to bet at and a model weight, the share of the final
 probability taken from the model instead of the sharp book's early price. Weight
 0 never trusts the model: it only shops for prices where a softer book is out of
@@ -40,6 +47,7 @@ Usage::
     python -m src.backtest
     python -m src.backtest --books b365 --weights 0 0.25 --first-season 2024
     python -m src.backtest --reference avg    # use the market average as the sharp view
+    python -m src.backtest --demargin shin --output-dir data/processed/backtest_shin
 """
 
 from __future__ import annotations
@@ -57,6 +65,7 @@ import pandas as pd
 
 from src.blend import BOOTSTRAP_BUDGET
 from src.config import PROCESSED_DIR
+from src.demargin import DEFAULT_METHOD, METHOD_NAMES, METHODS, check_method
 from src.dixon_coles import DEFAULT_MAX_GOALS, FloatArray
 from src.enrich import ENRICHED_OUTPUT
 from src.evaluate import Calibration, fit_calibration
@@ -85,6 +94,8 @@ BATCH_WEEKDAY: Final[int] = 4
 DEFAULT_BOOKS: Final[tuple[str, ...]] = ("b365", "avg", "max", "ps")
 DEFAULT_WEIGHTS: Final[tuple[float, ...]] = (0.0, 0.25, 0.5, 1.0)
 REFERENCE_BOOK: Final[str] = "ps"
+#: How the margin is taken out of the sharp book's prices (see :mod:`src.demargin`).
+DEMARGIN: Final[str] = DEFAULT_METHOD
 DEFAULT_RESAMPLES: Final[int] = 2000
 BACKTEST_DIR: Final[Path] = PROCESSED_DIR / "backtest"
 
@@ -342,7 +353,10 @@ def walk_forward_probabilities(
 # What can be bet on, and at what price
 # --------------------------------------------------------------------------- #
 def build_universe(
-    enriched: pd.DataFrame, model: pd.DataFrame, reference_book: str = REFERENCE_BOOK
+    enriched: pd.DataFrame,
+    model: pd.DataFrame,
+    reference_book: str = REFERENCE_BOOK,
+    demargin: str = DEMARGIN,
 ) -> pd.DataFrame:
     """Every selection that can be bet on and measured.
 
@@ -355,15 +369,20 @@ def build_universe(
             wide odds columns.
         model: Probabilities from :func:`walk_forward_probabilities`.
         reference_book: The sharp book (one of :data:`src.odds_history.FAIR_BOOKS`).
+        demargin: How the margin is taken out of the sharp book's early and
+            closing prices (one of :data:`src.demargin.METHODS`).
 
     Returns:
         ``match_id``, ``market_id``, ``selection``, ``probability``,
         ``push_probability``, ``p_reference`` (the book's early fair probability),
         ``p_close`` (its closing fair probability), ``season``, ``date`` and
         ``batch`` (the Friday of the coupon the match belongs to).
+
+    Raises:
+        ValueError: For an unknown ``demargin`` method.
     """
-    early = fair_view(enriched, "early", (reference_book,))[[*KEY, "p_fair"]]
-    close = fair_view(enriched, "close", (reference_book,))[[*KEY, "p_fair"]]
+    early = fair_view(enriched, "early", (reference_book,), demargin)[[*KEY, "p_fair"]]
+    close = fair_view(enriched, "close", (reference_book,), demargin)[[*KEY, "p_fair"]]
     universe = (
         early.rename(columns={"p_fair": "p_reference"})
         .merge(close.rename(columns={"p_fair": "p_close"}), on=KEY)
@@ -677,6 +696,7 @@ class BacktestResult:
         coverage: Per season, matches priced and matches in the universe per market.
         reference_book: The sharp book the bets were measured against.
         bankroll: Bankroll the stakes were sized on.
+        demargin: How the margin was taken out of the sharp book's prices.
     """
 
     bets: pd.DataFrame
@@ -688,6 +708,7 @@ class BacktestResult:
     coverage: pd.DataFrame
     reference_book: str
     bankroll: float
+    demargin: str = DEMARGIN
 
 
 def _coverage(universe: pd.DataFrame, calibrations: pd.DataFrame) -> pd.DataFrame:
@@ -714,6 +735,7 @@ def run_backtest(
     books: Sequence[str] = DEFAULT_BOOKS,
     weights: Sequence[float] = DEFAULT_WEIGHTS,
     reference_book: str = REFERENCE_BOOK,
+    demargin: str = DEMARGIN,
     config: ValueConfig | None = None,
     first_season: int = FIRST_SEASON,
     min_calibration_matches: int = MIN_CALIBRATION_MATCHES,
@@ -730,6 +752,8 @@ def run_backtest(
         weights: Model weights to try, each between 0 and 1.
         reference_book: The sharp book whose early price is the reference and
             whose closing price is the yardstick.
+        demargin: How the margin is taken out of the sharp book's early and
+            closing prices (one of :data:`src.demargin.METHODS`).
         config: Betting rules; its ``model_weight`` is replaced by each weight.
         first_season: First season to bet on.
         min_calibration_matches: Fewest earlier matches a calibration may use.
@@ -755,6 +779,7 @@ def run_backtest(
         raise ValueError(
             f"the reference must be one of {list(FAIR_BOOKS)}, got {reference_book!r}"
         )
+    check_method(demargin)
     configs = {weight: replace(config, model_weight=weight) for weight in weights}
     _require(enriched, ENRICHED_REQUIRED, "the match table")
     if enriched["match_id"].duplicated().any():
@@ -767,7 +792,7 @@ def run_backtest(
         first_season=first_season,
         min_calibration_matches=min_calibration_matches,
     )
-    universe = build_universe(enriched, model, reference_book)
+    universe = build_universe(enriched, model, reference_book, demargin)
     if universe.empty:
         raise ValueError(
             f"no match from season {first_season} on has a model probability and "
@@ -832,6 +857,7 @@ def run_backtest(
         coverage=coverage,
         reference_book=reference_book,
         bankroll=config.bankroll,
+        demargin=demargin,
     )
 
 
@@ -899,9 +925,10 @@ def format_backtest(result: BacktestResult) -> str:
     calibration_title = (
         "Calibration of the model, fitted on the seasons before each one"
     )
+    method = METHOD_NAMES.get(result.demargin, result.demargin)
     strategy_title = (
-        f"Strategies, early prices, measured against the {sharp} close. 95% "
-        "intervals resample whole weeks.\n"
+        f"Strategies, early prices, measured against the {sharp} close (margin "
+        f"taken out by {method}). 95% intervals resample whole weeks.\n"
         "  ROI: profit over amount staked; CLV: expected profit per unit if the "
         "closing price is right (positive = beat the close)\n"
         "  every price: one unit on every price the book quotes, the margin "
@@ -1016,6 +1043,13 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         default=REFERENCE_BOOK,
         help="sharp book: early price is the reference, close is the yardstick",
     )
+    parser.add_argument(
+        "--demargin",
+        choices=METHODS,
+        default=DEMARGIN,
+        help="how the margin is taken out of the sharp book's prices "
+        "(python -m src.margin_audit compares the methods; default: %(default)s)",
+    )
     parser.add_argument("--first-season", type=int, default=FIRST_SEASON)
     parser.add_argument("--min-edge", type=float, default=ValueConfig().min_edge)
     parser.add_argument("--resamples", type=int, default=DEFAULT_RESAMPLES)
@@ -1048,6 +1082,7 @@ def main(argv: list[str] | None = None) -> int:
             books=args.books,
             weights=args.weights,
             reference_book=args.reference,
+            demargin=args.demargin,
             config=ValueConfig(min_edge=args.min_edge),
             first_season=args.first_season,
             n_resamples=args.resamples,

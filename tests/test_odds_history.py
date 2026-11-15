@@ -12,6 +12,7 @@ import pandas as pd
 import pytest
 
 from src import logging_config
+from src.demargin import METHODS, remove_margin
 from src.odds_history import (
     BOOKS,
     FAIR_BOOKS,
@@ -392,6 +393,227 @@ def test_the_fair_view_of_nothing_is_empty_with_the_right_columns() -> None:
         "source",
         "p_fair",
     ]
+
+
+# --------------------------------------------------------------------------- #
+# Taking the margin out by the other methods
+# --------------------------------------------------------------------------- #
+#: One match priced like the golden markets of tests/test_demargin.py, so the
+#: expected probabilities are known to ten digits and every price is different.
+GOLDEN_PRICES = {
+    "ps_h": 2.6,
+    "ps_d": 2.4,
+    "ps_a": 4.3,
+    "ps_over25": 1.5,
+    "ps_under25": 2.74,
+}
+GOLDEN_FAIR = {
+    "proportional": {
+        ("1X2", "home"): 0.372025955299,
+        ("1X2", "draw"): 0.403028118241,
+        ("1X2", "away"): 0.224945926460,
+        ("OU:2.5", "over"): 0.646226415094,
+        ("OU:2.5", "under"): 0.353773584906,
+    },
+    "power": {
+        ("1X2", "home"): 0.372984404069,
+        ("1X2", "draw"): 0.405107167457,
+        ("1X2", "away"): 0.221908428474,
+        ("OU:2.5", "over"): 0.653152279805,
+        ("OU:2.5", "under"): 0.346847720195,
+    },
+    "shin": {
+        ("1X2", "home"): 0.372994060332,
+        ("1X2", "draw"): 0.404779410920,
+        ("1X2", "away"): 0.222226528748,
+        ("OU:2.5", "over"): 0.650851581509,
+        ("OU:2.5", "under"): 0.349148418491,
+    },
+}
+
+
+def golden_offers() -> pd.DataFrame:
+    frame = base(1)
+    for column, value in GOLDEN_PRICES.items():
+        frame[column] = value
+    return odds_long(frame, "early", ("ps",))
+
+
+@pytest.mark.parametrize("method", METHODS)
+def test_each_selection_gets_the_probability_of_its_own_price(method: str) -> None:
+    offers = golden_offers()
+    fair = offers.assign(p=fair_probabilities(offers, method)).set_index(
+        ["market_id", "selection"]
+    )["p"]
+    assert len(fair) == len(GOLDEN_FAIR[method])
+    for key, expected in GOLDEN_FAIR[method].items():
+        assert fair[key] == pytest.approx(expected, abs=1e-10)
+
+
+def test_the_default_method_is_proportional_and_the_value_engines_rule() -> None:
+    offers = odds_long(exact_table(), "early")
+    default = fair_probabilities(offers)
+    pd.testing.assert_series_equal(default, fair_probabilities(offers, "proportional"))
+    # by hand: 1/1.9 over the booksum of Pinnacle's quote of match a
+    ps = odds_long(hand(), "early", ("ps",))
+    by_key = ps.assign(p=fair_probabilities(ps)).set_index(
+        ["match_id", "market_id", "selection"]
+    )["p"]
+    assert by_key[("a", "1X2", "home")] == pytest.approx(0.5)
+
+
+@pytest.mark.parametrize("method", METHODS)
+def test_every_quote_of_every_book_adds_up_to_one_by_every_method(method: str) -> None:
+    offers = odds_long(exact_table(), "early")
+    fair = offers.assign(p=fair_probabilities(offers, method))
+    totals = fair.groupby(["match_id", "bookmaker", "market_id"])["p"].sum()
+    np.testing.assert_allclose(totals, 1.0, atol=1e-12)
+    assert len(totals) == 8 * 4 * 2
+
+
+@pytest.mark.parametrize("method", ["power", "shin"])
+def test_the_other_methods_agree_with_the_margin_module_quote_by_quote(
+    method: str,
+) -> None:
+    offers = odds_long(exact_table(n=6, seed=3), "close")
+    fair = offers.assign(p=fair_probabilities(offers, method))
+    checked = 0
+    for (_, _, market_id), quote in fair.groupby(
+        ["match_id", "bookmaker", "market_id"]
+    ):
+        names = [name for name, _ in MARKETS[market_id]]
+        priced_quote = quote.set_index("selection").loc[names]
+        expected = remove_margin(priced_quote["odds"].to_numpy(), method)
+        np.testing.assert_allclose(priced_quote["p"].to_numpy(), expected, rtol=1e-12)
+        checked += 1
+    assert checked == 6 * 4 * 2
+
+
+@pytest.mark.parametrize("method", ["power", "shin"])
+def test_the_other_methods_take_more_off_the_long_shot_than_proportional_does(
+    method: str,
+) -> None:
+    offers = golden_offers()
+    other = offers.assign(p=fair_probabilities(offers, method))
+    scaled = offers.assign(p=fair_probabilities(offers))
+    key = ["market_id", "selection"]
+    joined = other.merge(scaled, on=key, suffixes=("_other", "_scaled"))
+    for market_id, longest in (("1X2", "away"), ("OU:2.5", "under")):
+        row = joined[
+            (joined["market_id"] == market_id) & (joined["selection"] == longest)
+        ]
+        assert (row["p_other"] < row["p_scaled"]).all()
+
+
+@pytest.mark.parametrize("method", METHODS)
+def test_another_method_keeps_the_index_and_flags_incomplete_quotes(
+    method: str,
+) -> None:
+    offers = odds_long(hand(), "early", ("ps",))
+    assert fair_probabilities(offers, method).index.equals(offers.index)
+    lonely = offers[~((offers["match_id"] == "a") & (offers["selection"] == "draw"))]
+    fair = lonely.assign(p=fair_probabilities(lonely, method))
+    broken = fair[(fair["match_id"] == "a") & (fair["market_id"] == "1X2")]
+    assert broken["p"].isna().all()
+    assert fair.loc[fair["match_id"] == "b", "p"].notna().all()
+    # the over/under quote of the same match is complete and is still priced
+    assert (
+        fair.loc[(fair["match_id"] == "a") & (fair["market_id"] == "OU:2.5"), "p"]
+        .notna()
+        .all()
+    )
+
+
+@pytest.mark.parametrize("method", ["power", "shin"])
+def test_another_method_gives_every_offer_the_same_value_whatever_the_row_order(
+    method: str,
+) -> None:
+    offers = odds_long(exact_table(n=5, seed=4), "early")
+    shuffled = offers.sample(frac=1.0, random_state=0)
+    keys = ["match_id", "bookmaker", "market_id", "selection"]
+    first = offers.assign(p=fair_probabilities(offers, method)).set_index(keys)["p"]
+    second = shuffled.assign(p=fair_probabilities(shuffled, method)).set_index(keys)[
+        "p"
+    ]
+    np.testing.assert_allclose(first.sort_index(), second.sort_index(), rtol=1e-13)
+
+
+@pytest.mark.parametrize("method", ["power", "shin"])
+def test_the_other_methods_need_no_bookmaker_column(method: str) -> None:
+    offers = golden_offers()
+    alone = offers.drop(columns="bookmaker")
+    pd.testing.assert_series_equal(
+        fair_probabilities(alone, method), fair_probabilities(offers, method)
+    )
+
+
+@pytest.mark.parametrize("method", ["power", "shin"])
+def test_the_other_methods_price_only_the_markets_with_history(method: str) -> None:
+    offers = pd.DataFrame(
+        {
+            "match_id": ["a", "a"],
+            "market_id": ["BTTS", "BTTS"],
+            "selection": ["yes", "no"],
+            "odds": [1.8, 2.0],
+        }
+    )
+    assert fair_probabilities(offers).notna().all()  # proportional knows every market
+    assert fair_probabilities(offers, method).isna().all()
+
+
+@pytest.mark.parametrize("method", ["power", "shin"])
+def test_a_quote_with_an_unknown_selection_is_not_guessed(method: str) -> None:
+    offers = golden_offers()
+    renamed = offers.assign(
+        selection=offers["selection"].where(offers["selection"] != "away", "foo")
+    )
+    assert fair_probabilities(renamed).notna().all()  # complete by count
+    fair = renamed.assign(p=fair_probabilities(renamed, method))
+    one_x_two = fair[fair["market_id"] == "1X2"]
+    over_under = fair[fair["market_id"] == "OU:2.5"]
+    assert one_x_two["p"].isna().all()
+    assert over_under["p"].notna().all()
+
+
+@pytest.mark.parametrize("method", METHODS)
+def test_a_selection_priced_twice_is_an_error_for_every_method(method: str) -> None:
+    offers = golden_offers()
+    with pytest.raises(ValueError, match="more than one price"):
+        fair_probabilities(pd.concat([offers, offers.iloc[[0]]]), method)
+
+
+def test_an_unknown_method_is_rejected_everywhere() -> None:
+    offers = golden_offers()
+    with pytest.raises(ValueError, match="unknown margin-removal method"):
+        fair_probabilities(offers, "additive")
+    with pytest.raises(ValueError, match="unknown margin-removal method"):
+        fair_probabilities(offers.iloc[:0], "additive")
+    with pytest.raises(ValueError, match="unknown margin-removal method"):
+        fair_view(hand(), "close", method="additive")
+    with pytest.raises(ValueError, match="unknown margin-removal method"):
+        fair_view(hand()[["match_id"]], "close", method="additive")
+
+
+@pytest.mark.parametrize("method", METHODS)
+def test_the_fair_view_passes_the_method_on(method: str) -> None:
+    frame = base(1)
+    for column, value in GOLDEN_PRICES.items():
+        frame[column.replace("ps_", "psc_")] = value
+    view = fair_view(frame, "close", method=method).set_index(
+        ["market_id", "selection"]
+    )
+    for key, expected in GOLDEN_FAIR[method].items():
+        assert view.loc[key, "p_fair"] == pytest.approx(expected, abs=1e-10)
+    assert set(view["source"]) == {"ps"}
+
+
+def test_the_fair_view_is_proportional_unless_told_otherwise() -> None:
+    frame = exact_table(n=4)
+    pd.testing.assert_frame_equal(
+        fair_view(frame, "close"), fair_view(frame, "close", method="proportional")
+    )
+    differs = fair_view(frame, "close", method="shin")["p_fair"]
+    assert not np.allclose(differs, fair_view(frame, "close")["p_fair"], atol=1e-6)
 
 
 # --------------------------------------------------------------------------- #

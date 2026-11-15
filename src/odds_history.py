@@ -35,6 +35,7 @@ import numpy as np
 import pandas as pd
 
 from src.blend import paired_bootstrap_interval
+from src.demargin import DEFAULT_METHOD, check_method, remove_margin
 from src.enrich import ENRICHED_OUTPUT
 from src.logging_config import setup_logging
 from src.markets import market_set
@@ -162,35 +163,74 @@ def odds_long(
 # --------------------------------------------------------------------------- #
 # Taking the margin out
 # --------------------------------------------------------------------------- #
-def fair_probabilities(offers: pd.DataFrame) -> pd.Series:
+def fair_probabilities(offers: pd.DataFrame, method: str = DEFAULT_METHOD) -> pd.Series:
     """Margin-free probability of every offer.
 
-    Each bookmaker's market is scaled so its inverse odds add up to one, which
-    removes the margin in proportion to each price (the same rule the value
-    engine uses, :func:`src.value.reference_probabilities`).
+    Each bookmaker's market is brought back to probabilities that add up to one.
+    ``proportional``, the default, scales the inverse odds, which removes the
+    margin in proportion to each price (the rule the value engine uses,
+    :func:`src.value.reference_probabilities`). ``power`` and ``shin`` take more
+    of the margin off long shots (:mod:`src.demargin`); they are defined for the
+    markets of :data:`MARKETS`, and other markets come back NaN.
 
     Args:
         offers: Prices from :func:`odds_long`.
+        method: One of :data:`src.demargin.METHODS`.
 
     Returns:
-        A probability per offer, aligned to ``offers``.
+        A probability per offer, aligned to ``offers``; NaN where the quote is not
+        complete.
+
+    Raises:
+        ValueError: For an unknown ``method`` or a selection priced twice.
     """
-    return reference_probabilities(offers.assign(push_probability=0.0))
+    check_method(method)
+    proportional = reference_probabilities(offers.assign(push_probability=0.0))
+    if method == "proportional":
+        return proportional
+    keys = [
+        column
+        for column in ("match_id", "market_id", "bookmaker")
+        if column in offers.columns
+    ]
+    complete = proportional.notna().to_numpy()
+    fair = np.full(len(offers), np.nan)
+    for market_id, selections in MARKETS.items():
+        rows = np.flatnonzero(complete & (offers["market_id"] == market_id).to_numpy())
+        if rows.size == 0:
+            continue
+        part = offers.iloc[rows]
+        quote = part.groupby(keys, sort=False).ngroup().to_numpy()
+        names = {name: position for position, (name, _) in enumerate(selections)}
+        column = part["selection"].map(names).to_numpy(dtype="float64")
+        table = np.full((int(quote.max()) + 1, len(selections)), np.nan)
+        known = np.isfinite(column)
+        place = column[known].astype(np.intp)
+        table[quote[known], place] = part["odds"].to_numpy(dtype="float64")[known]
+        fair[rows[known]] = remove_margin(table, method)[quote[known], place]
+    return pd.Series(fair, index=offers.index, dtype="float64")
 
 
 def _fair_quotes(
-    enriched: pd.DataFrame, snapshot: str, books: Sequence[str]
+    enriched: pd.DataFrame,
+    snapshot: str,
+    books: Sequence[str],
+    method: str = DEFAULT_METHOD,
 ) -> pd.DataFrame:
     """Complete quotes of the given books, each with its margin-free probability."""
+    check_method(method)
     quotes = odds_long(enriched, snapshot, books)
     if quotes.empty:
         return quotes.assign(p_fair=pd.Series(dtype="float64"))
-    quotes["p_fair"] = fair_probabilities(quotes).to_numpy(dtype="float64")
+    quotes["p_fair"] = fair_probabilities(quotes, method).to_numpy(dtype="float64")
     return quotes.dropna(subset=["p_fair"]).reset_index(drop=True)
 
 
 def fair_view(
-    enriched: pd.DataFrame, snapshot: str, books: Sequence[str] = FAIR_BOOKS
+    enriched: pd.DataFrame,
+    snapshot: str,
+    books: Sequence[str] = FAIR_BOOKS,
+    method: str = DEFAULT_METHOD,
 ) -> pd.DataFrame:
     """The sharpest margin-free probability available for every selection.
 
@@ -198,11 +238,20 @@ def fair_view(
     quote is complete or absent, so every selection of a match's market comes
     from the same book and the probabilities still add up to one.
 
+    Args:
+        enriched: The enriched match table with the wide odds columns.
+        snapshot: ``"early"`` or ``"close"``.
+        books: Books to try, sharpest first.
+        method: How the margin is taken out (see :func:`fair_probabilities`).
+
     Returns:
         ``match_id``, ``market_id``, ``selection``, ``source`` (the book used) and
         ``p_fair``, sorted by those keys.
+
+    Raises:
+        ValueError: For an unknown ``snapshot`` or ``method``.
     """
-    quotes = _fair_quotes(enriched, snapshot, books)
+    quotes = _fair_quotes(enriched, snapshot, books, method)
     rank = {book: position for position, book in enumerate(books)}
     best = (
         quotes.assign(_rank=quotes["bookmaker"].map(rank))

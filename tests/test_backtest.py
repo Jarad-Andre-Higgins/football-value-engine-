@@ -6,7 +6,7 @@ import logging
 import re
 import sys
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -38,9 +38,10 @@ from src.backtest import (
     verdict,
     walk_forward_probabilities,
 )
+from src.demargin import METHOD_NAMES, METHODS, remove_margin
 from src.evaluate import fit_calibration
 from src.markets import fixture_markets
-from src.odds_history import KEY, MARKETS
+from src.odds_history import KEY, MARKETS, fair_view
 from src.value import ValueConfig
 
 
@@ -622,6 +623,55 @@ def test_the_universe_carries_the_references_early_and_closing_probabilities() -
     over = expected_row(universe, "a", "OU:2.5", "over")
     assert over["p_reference"] == pytest.approx(0.5)  # 1.9 against 1.9
     assert over["p_close"] == pytest.approx((1 / 1.85) / (1 / 1.85 + 1 / 2.0))
+
+
+@pytest.mark.parametrize("method", METHODS)
+def test_the_universe_takes_the_margin_out_by_the_chosen_method(method: str) -> None:
+    frame = hand_table()
+    universe = build_universe(frame, hand_model(), "ps", method)
+    quotes = {
+        ("1X2", "early"): ["ps_h", "ps_d", "ps_a"],
+        ("1X2", "close"): ["psc_h", "psc_d", "psc_a"],
+        ("OU:2.5", "early"): ["ps_over25", "ps_under25"],
+        ("OU:2.5", "close"): ["psc_over25", "psc_under25"],
+    }
+    names = {
+        market_id: [name for name, _ in MARKETS[market_id]] for market_id in MARKETS
+    }
+    for match, match_id in ((3, "d"), (0, "a")):
+        for (market_id, snapshot), columns in quotes.items():
+            fair = remove_margin(
+                frame.loc[match, columns].to_numpy(dtype=float), method
+            )
+            column = "p_reference" if snapshot == "early" else "p_close"
+            for position, selection in enumerate(names[market_id]):
+                row = expected_row(universe, match_id, market_id, selection)
+                assert row[column] == pytest.approx(fair[position], rel=1e-12)
+
+
+def test_other_methods_move_the_probability_off_the_long_shot() -> None:
+    frame, model = hand_table(), hand_model()
+    scaled = build_universe(frame, model)
+    for method in ("power", "shin"):
+        other = build_universe(frame, model, "ps", method)
+        longest = expected_row(other, "d", "1X2", "away")  # priced at 6.0
+        proportional = expected_row(scaled, "d", "1X2", "away")
+        assert longest["p_reference"] < proportional["p_reference"] - 1e-4
+        assert longest["p_close"] < proportional["p_close"] - 1e-4
+        favourite = expected_row(other, "d", "1X2", "home")  # priced at 1.5
+        plain = expected_row(scaled, "d", "1X2", "home")
+        assert favourite["p_reference"] > plain["p_reference"] + 1e-4
+
+
+def test_the_universe_is_proportional_unless_told_otherwise() -> None:
+    explicit = build_universe(hand_table(), hand_model(), "ps", "proportional")
+    pd.testing.assert_frame_equal(build_universe(hand_table(), hand_model()), explicit)
+    assert bt.DEMARGIN == "proportional"
+
+
+def test_an_unknown_method_cannot_build_a_universe() -> None:
+    with pytest.raises(ValueError, match="unknown margin-removal method 'additive'"):
+        build_universe(hand_table(), hand_model(), "ps", "additive")
 
 
 def test_the_universe_pairs_each_selection_with_its_own_model_probability() -> None:
@@ -1236,6 +1286,7 @@ def test_the_command_defaults_are_the_documented_ones() -> None:
     assert args.books == ["b365", "avg", "max", "ps"]
     assert args.weights == [0.0, 0.25, 0.5, 1.0]
     assert args.reference == "ps"
+    assert args.demargin == "proportional"
     assert args.first_season == 2023
     assert args.min_edge == ValueConfig().min_edge > 0.0
     assert args.resamples == 2_000
@@ -1660,6 +1711,46 @@ def test_the_market_average_can_be_the_sharp_view(small_world: World) -> None:
     assert "market average close" in format_backtest(run)
 
 
+def test_the_margin_removal_method_is_checked_before_any_work(
+    small_world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def never(*args: object, **kwargs: object) -> None:
+        raise AssertionError("the model was priced before the method was checked")
+
+    monkeypatch.setattr(bt, "walk_forward_probabilities", never)
+    with pytest.raises(ValueError, match="unknown margin-removal method 'additive'"):
+        run_backtest(small_world.frame, oof_for(small_world), demargin="additive")
+
+
+def test_the_backtest_uses_and_records_the_margin_removal_method(
+    small_world: World,
+) -> None:
+    frame, oof = small_world.frame, oof_for(small_world)
+    options = {
+        "books": ("b365",),
+        "weights": (0.0,),
+        "n_resamples": 20,
+        "min_calibration_matches": 500,
+    }
+    run = run_backtest(frame, oof, demargin="shin", **options)  # type: ignore[arg-type]
+    assert run.demargin == "shin"
+    assert len(run.bets) > 0
+    early = fair_view(frame, "early", ("ps",), "shin")[[*KEY, "p_fair"]]
+    close = fair_view(frame, "close", ("ps",), "shin")[[*KEY, "p_fair"]]
+    joined = run.bets.merge(early, on=KEY).merge(
+        close, on=KEY, suffixes=("_early", "_close")
+    )
+    assert len(joined) == len(run.bets)
+    np.testing.assert_allclose(joined["p_reference"], joined["p_fair_early"])
+    np.testing.assert_allclose(joined["p_close"], joined["p_fair_close"])
+    scaled = fair_view(frame, "close", ("ps",))[[*KEY, "p_fair"]]
+    against = joined.merge(scaled, on=KEY)  # the same selections, scaled by hand
+    assert len(against) == len(joined)
+    assert not np.allclose(against["p_close"], against["p_fair"], atol=1e-4)
+    default = run_backtest(frame, oof, **options)  # type: ignore[arg-type]
+    assert default.demargin == "proportional"
+
+
 # --------------------------------------------------------------------------- #
 # Reading and saving the result
 # --------------------------------------------------------------------------- #
@@ -1671,12 +1762,32 @@ def test_the_report_shows_every_strategy_and_the_yardstick(
     assert "complete early and closing Pinnacle quote" in text
     assert "Calibration of the model" in text
     assert "Strategies, early prices, measured against the Pinnacle close" in text
+    assert "margin taken out by proportional scaling" in text
     assert "What the bets looked like" in text
     assert "constant bankroll of 1,000" in text
     assert text.count("every price") >= 2 * 2  # two books, two tables
     assert "Bet365" in text and "market average" in text
     assert "weight 0.00" in text and "weight 1.00" in text
     assert "ROI 95% interval" in text and "CLV 95% interval" in text
+
+
+@pytest.mark.parametrize("method", METHODS)
+def test_the_report_names_how_the_margin_was_taken_out(method: str) -> None:
+    text = format_backtest(replace(hand_result(), demargin=method))
+    name = METHOD_NAMES[method]
+    sentence = (
+        f"close (margin taken out by {name}). 95% intervals resample whole weeks."
+    )
+    assert sentence in text
+
+
+def test_a_method_without_a_readable_name_is_shown_by_its_code() -> None:
+    text = format_backtest(replace(hand_result(), demargin="zzz"))
+    assert "(margin taken out by zzz). 95% intervals" in text
+
+
+def test_a_result_made_without_a_method_took_the_margin_out_proportionally() -> None:
+    assert hand_result().demargin == "proportional"
 
 
 def test_the_report_leaves_out_the_money_columns_for_the_yardstick(
@@ -2043,6 +2154,34 @@ def test_the_command_can_use_another_book_as_the_sharp_view(
 
 
 @pytest.mark.usefixtures("isolated_logging")
+def test_the_command_can_take_the_margin_out_another_way(
+    inputs: tuple[Path, Path], tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    enriched, oof = inputs
+    arguments = ["--enriched", str(enriched), "--oof", str(oof), "--books", "b365"]
+    arguments += ["--weights", "0", "--resamples", "20", "--demargin", "power"]
+    arguments += ["--output-dir", str(tmp_path / "power")]
+    with caplog.at_level(logging.INFO):
+        assert main(arguments) == 0
+    assert "margin taken out by the power method" in caplog.text
+    bets = pd.read_parquet(tmp_path / "power" / "bets.parquet")
+    close = fair_view(pd.read_parquet(enriched), "close", ("ps",), "power")
+    joined = bets.merge(close, on=KEY)
+    assert len(joined) == len(bets) > 0
+    np.testing.assert_allclose(joined["p_close"], joined["p_fair"])
+
+
+def test_the_command_only_accepts_the_known_methods(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    for method in METHODS:
+        assert bt._parse_args(["--demargin", method]).demargin == method
+    with pytest.raises(SystemExit):
+        bt._parse_args(["--demargin", "additive"])
+    assert "invalid choice" in capsys.readouterr().err
+
+
+@pytest.mark.usefixtures("isolated_logging")
 def test_the_command_names_the_step_to_run_when_an_input_is_missing(
     inputs: tuple[Path, Path], tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -2089,12 +2228,13 @@ def test_the_command_passes_every_option_on(
     enriched, oof = inputs
     options = ["--books", "avg", "max", "--weights", "0.5", "1", "--reference", "avg"]
     options += ["--first-season", "2024", "--min-edge", "0.07", "--resamples", "123"]
-    options += ["--seed", "9"]
+    options += ["--seed", "9", "--demargin", "shin"]
     assert main(["--enriched", str(enriched), "--oof", str(oof), *options]) == 1
     assert seen == {
         "books": ["avg", "max"],
         "weights": [0.5, 1.0],
         "reference_book": "avg",
+        "demargin": "shin",
         "config": ValueConfig(min_edge=0.07),
         "first_season": 2024,
         "n_resamples": 123,

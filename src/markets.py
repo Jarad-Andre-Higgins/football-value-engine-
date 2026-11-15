@@ -394,6 +394,38 @@ def _matrix_for(lam: float, mu: float, rho: float, max_goals: int) -> FloatArray
     )
 
 
+def score_matrices(
+    lam: Sequence[float] | FloatArray,
+    mu: Sequence[float] | FloatArray,
+    rho: float,
+    max_goals: int = DEFAULT_MAX_GOALS,
+) -> FloatArray:
+    """Score matrices for many fixtures, stacked into one array.
+
+    Rates and ``rho`` are clipped into their valid ranges first, so extreme model
+    outputs still give a proper matrix; every caller that prices fixtures goes
+    through here, so they all clip the same way.
+
+    Args:
+        lam: Home goal rate of each fixture.
+        mu: Away goal rate of each fixture (same length as ``lam``).
+        rho: Dixon-Coles dependence parameter.
+        max_goals: Size of the score grid.
+
+    Returns:
+        Array of shape ``(fixtures, max_goals + 1, max_goals + 1)``.
+
+    Raises:
+        ValueError: If ``lam`` and ``mu`` differ in length.
+    """
+    if len(lam) != len(mu):
+        raise ValueError("lam and mu must have one entry per fixture")
+    size = max_goals + 1
+    if len(lam) == 0:
+        return np.empty((0, size, size), dtype="float64")
+    return np.stack([_matrix_for(a, b, rho, max_goals) for a, b in zip(lam, mu)])
+
+
 def fixture_markets(
     rates: pd.DataFrame,
     rho: float,
@@ -416,11 +448,11 @@ def fixture_markets(
     ids = list(rates.index if match_ids is None else match_ids)
     if len(ids) != len(rates):
         raise ValueError("match_ids must have one entry per row of rates")
-    matrices = np.stack(
-        [
-            _matrix_for(a, b, rho, max_goals)
-            for a, b in zip(rates["lam_home"], rates["lam_away"])
-        ]
+    matrices = score_matrices(
+        rates["lam_home"].to_numpy(dtype="float64"),
+        rates["lam_away"].to_numpy(dtype="float64"),
+        rho,
+        max_goals,
     )
     win, push = selection_probabilities(matrices)
     catalog = market_set(max_goals).catalog

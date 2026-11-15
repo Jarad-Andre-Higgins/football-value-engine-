@@ -20,6 +20,7 @@ from src.markets import (
     main,
     market_set,
     market_table,
+    score_matrices,
     selection_probabilities,
 )
 
@@ -269,6 +270,39 @@ def test_fixture_markets_accepts_explicit_ids_and_clips_extreme_inputs() -> None
     assert np.isfinite(table["probability"]).all()
     with pytest.raises(ValueError, match="one entry per row"):
         fixture_markets(rates, rho=0.0, match_ids=["only-one"])
+
+
+def test_score_matrices_stack_one_matrix_per_fixture() -> None:
+    stacked = score_matrices([1.8, 0.9, 2.4], [0.9, 1.4, 0.6], rho=-0.05)
+    assert stacked.shape == (3, N, N)
+    np.testing.assert_allclose(stacked[1], score_matrix(0.9, 1.4, -0.05))
+    np.testing.assert_allclose(stacked.sum(axis=(1, 2)), 1.0)
+    smaller = score_matrices([1.0], [1.0], rho=0.0, max_goals=6)
+    assert smaller.shape == (1, 7, 7)
+
+
+def test_score_matrices_clip_extreme_inputs_like_fixture_markets() -> None:
+    lam, mu = np.array([0.0, 50.0]), np.array([-1.0, 50.0])
+    stacked = score_matrices(lam, mu, rho=-0.9)
+    assert np.isfinite(stacked).all()
+    win, _ = selection_probabilities(stacked)
+    table = fixture_markets(
+        pd.DataFrame({"lam_home": lam, "lam_away": mu}), rho=-0.9, match_ids=["a", "b"]
+    )
+    np.testing.assert_allclose(
+        win.ravel(), table["probability"].to_numpy(dtype="float64")
+    )
+
+
+def test_score_matrices_handle_no_fixtures_and_mismatched_lengths() -> None:
+    assert score_matrices([], [], rho=0.0).shape == (0, N, N)
+    assert score_matrices(np.array([]), np.array([]), rho=0.0, max_goals=6).shape == (
+        0,
+        7,
+        7,
+    )
+    with pytest.raises(ValueError, match="one entry per fixture"):
+        score_matrices([1.0, 2.0], [1.0], rho=0.0)
 
 
 # --------------------------------------------------------------------------- #

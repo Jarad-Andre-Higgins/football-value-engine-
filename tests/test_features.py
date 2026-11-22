@@ -16,6 +16,7 @@ from src.elo import compute_elo
 from src.features import (
     HALF_LIVES_DAYS,
     LONG,
+    RESULT_COLUMNS,
     TARGET_COLUMNS,
     TEAM_FEATURES,
     add_form_features,
@@ -426,6 +427,92 @@ def test_two_leagues_do_not_contaminate_each_other() -> None:
             single[column].to_numpy(dtype="float64"),
             equal_nan=True,
         )
+
+
+# --------------------------------------------------------------------------- #
+# Fixtures: matches with no result yet
+# --------------------------------------------------------------------------- #
+def without_results(matches: pd.DataFrame, cutoff: pd.Timestamp) -> pd.DataFrame:
+    """The table as it stood at ``cutoff``: every match from then on is a fixture."""
+    table = matches.copy()
+    columns = list(RESULT_COLUMNS)
+    table[columns] = table[columns].astype("float64")
+    table.loc[table["date"] >= cutoff, columns] = np.nan
+    return table
+
+
+def cutoff_of(matches: pd.DataFrame) -> pd.Timestamp:
+    return pd.Timestamp(matches["date"].sort_values().iloc[int(len(matches) * 0.6)])
+
+
+def assert_features_equal(
+    got: pd.DataFrame, want: pd.DataFrame, where: np.ndarray
+) -> None:
+    assert where.sum() >= 2  # a comparison of nothing would pass for the wrong reason
+    for column in feature_columns():
+        np.testing.assert_allclose(
+            got.loc[where, column].to_numpy(dtype="float64"),
+            want.loc[where, column].to_numpy(dtype="float64"),
+            equal_nan=True,
+            err_msg=column,
+        )
+
+
+def test_fixtures_leave_the_features_of_played_matches_untouched(
+    matches: pd.DataFrame, built: pd.DataFrame
+) -> None:
+    cutoff = cutoff_of(matches)
+    rebuilt = build_features(without_results(matches, cutoff))
+    assert rebuilt["match_id"].tolist() == built["match_id"].tolist()
+    assert_features_equal(built, rebuilt, (built["date"] < cutoff).to_numpy())
+
+
+def test_a_fixtures_features_are_those_it_gets_once_the_match_is_played(
+    matches: pd.DataFrame, built: pd.DataFrame
+) -> None:
+    cutoff = cutoff_of(matches)
+    rebuilt = build_features(without_results(matches, cutoff))
+    # on the first day of the fixtures nothing played after the cut-off can matter
+    first_day = (built["date"] == cutoff).to_numpy()
+    assert_features_equal(built, rebuilt, first_day)
+    assert rebuilt.loc[first_day, "home_elo"].notna().all()
+    assert rebuilt.loc[first_day, f"home_xg_for_ew{LONG}"].notna().any()
+
+
+def test_a_fixtures_targets_are_empty_and_a_played_matchs_are_not(
+    matches: pd.DataFrame,
+) -> None:
+    cutoff = cutoff_of(matches)
+    rebuilt = build_features(without_results(matches, cutoff))
+    ahead = rebuilt["date"] >= cutoff
+    assert ahead.sum() > 10
+    assert rebuilt.loc[ahead, list(TARGET_COLUMNS)].isna().all().all()
+    played = rebuilt.loc[~ahead]
+    assert (
+        played[["target_home_goals", "target_away_goals", "target_result"]]
+        .notna()
+        .all()
+        .all()
+    )
+
+
+def test_points_are_missing_until_a_match_has_a_score(matches: pd.DataFrame) -> None:
+    cutoff = cutoff_of(matches)
+    long = to_team_matches(without_results(matches, cutoff))
+    assert long.loc[long["date"] >= cutoff, "points"].isna().all()
+    assert long.loc[long["date"] < cutoff, "points"].notna().all()
+
+
+def test_the_league_context_does_not_count_fixtures(matches: pd.DataFrame) -> None:
+    cutoff = cutoff_of(matches)
+    context = league_context(without_results(matches, cutoff)).set_index("date")
+    fixture_days = context.index > cutoff
+    assert fixture_days.sum() > 5
+    for column in ("league_avg_goals_home", "league_avg_goals_away", "league_avg_xg"):
+        before = context.loc[cutoff, column]
+        assert np.isfinite(before)
+        # fixture days add nothing: they see what the day before them saw
+        np.testing.assert_allclose(context.loc[fixture_days, column], before)
 
 
 # --------------------------------------------------------------------------- #

@@ -323,6 +323,97 @@ def test_the_reference_bookmaker_is_used_or_its_absence_reported() -> None:
     )
 
 
+def three_books(fixtures: pd.DataFrame) -> pd.DataFrame:
+    """A sharp book, a soft one you can use and a best-price line nobody can bet at."""
+    return pd.concat(
+        [
+            book(fixtures, "sharp", 0.02),
+            generous(book(fixtures, "soft", 0.10), "M2", "BTTS", "yes", 1.35),
+            generous(book(fixtures, "best", 0.10), "M2", "BTTS", "yes", 1.6),
+        ],
+        ignore_index=True,
+    )
+
+
+def test_bet_at_recommends_only_the_books_you_use_but_judges_by_the_sharp_one() -> None:
+    fixtures = fixtures_frame()
+    odds = three_books(fixtures)
+    config = ValueConfig(model_weight=0.0)
+    anywhere = make_coupon(
+        fixtures, odds, rho=RHO, config=config, reference_bookmaker="sharp"
+    )
+    assert anywhere.bets["bookmaker"].tolist() == ["best"]  # the best price wins
+    mine = make_coupon(
+        fixtures,
+        odds,
+        rho=RHO,
+        config=config,
+        reference_bookmaker="sharp",
+        bet_at=[" Soft ", ""],  # names are tidied, blanks ignored
+    )
+    assert mine.bets["bookmaker"].tolist() == ["soft"]
+    assert mine.bets["reference_source"].tolist() == ["reference book"]
+    assert set(mine.offers["bookmaker"]) == {"soft"} and mine.notes == ()
+    # The sharp book still sets the probability: the edge equals the one found
+    # when "soft" is the only soft book around.
+    alone = make_coupon(
+        fixtures,
+        odds[odds["bookmaker"] != "best"],
+        rho=RHO,
+        config=config,
+        reference_bookmaker="sharp",
+    )
+    assert mine.bets.iloc[0]["edge"] == pytest.approx(alone.bets.iloc[0]["edge"])
+    assert mine.bets.iloc[0]["p_final"] == pytest.approx(alone.bets.iloc[0]["p_final"])
+
+
+def test_the_reference_book_is_not_for_sale_unless_named_in_bet_at() -> None:
+    fixtures = fixtures_frame()
+    odds = pd.concat(
+        [book(fixtures, "sharp", -0.08), book(fixtures, "soft", 0.10)],
+        ignore_index=True,
+    )  # a "sharp" book that pays more than fair: every one of its prices is value
+    config = ValueConfig(model_weight=0.0)
+    kwargs = {"rho": RHO, "config": config, "reference_bookmaker": "sharp"}
+    open_ = make_coupon(fixtures, odds, **kwargs)
+    assert len(open_.bets) == 3 and set(open_.bets["bookmaker"]) == {"sharp"}
+    shut = make_coupon(fixtures, odds, bet_at=["soft"], **kwargs)
+    assert shut.bets.empty and set(shut.offers["bookmaker"]) == {"soft"}
+    named = make_coupon(fixtures, odds, bet_at=["soft", "SHARP"], **kwargs)
+    assert set(named.bets["bookmaker"]) == {"sharp"}
+
+
+def test_bet_at_without_a_reference_book_still_limits_the_offers() -> None:
+    fixtures = fixtures_frame()
+    odds = pd.concat([book(fixtures, "a"), book(fixtures, "b")], ignore_index=True)
+    coupon = make_coupon(
+        fixtures, odds, rho=RHO, config=TRUST_MODEL, bet_at=["b"], stake_step=0
+    )
+    assert set(coupon.offers["bookmaker"]) == {"b"} and coupon.notes == ()
+    assert set(coupon.offers["reference_source"]) == {"own prices"}
+
+
+def test_bet_at_with_nobody_in_the_odds_gives_an_empty_coupon_and_says_why() -> None:
+    fixtures = fixtures_frame()
+    coupon = make_coupon(
+        fixtures,
+        book(fixtures, "sharp", 0.02),
+        rho=RHO,
+        config=ValueConfig(model_weight=0.0),
+        reference_bookmaker="sharp",
+        bet_at=["nobody", "betpawa"],
+    )
+    assert coupon.bets.empty and coupon.offers.empty
+    assert coupon.notes == ("No prices from betpawa, nobody",)
+
+
+def test_bet_at_cannot_be_empty() -> None:
+    fixtures = fixtures_frame()
+    for names in ([], ["", "  "]):
+        with pytest.raises(ValueError, match="bet_at names no bookmaker"):
+            make_coupon(fixtures, book(fixtures), rho=RHO, bet_at=names)
+
+
 def test_bets_come_in_match_date_order_then_best_edge_first() -> None:
     fixtures = fixtures_frame()
     odds = book(fixtures)
@@ -781,6 +872,26 @@ def test_a_real_run_uses_the_fitted_weight_and_the_chosen_currency(
     assert (record["stake"] % 100 == 0).all() and (record["stake"] >= 100).all()
     assert (record["stake"] <= 0.02 * 100_000 + 1e-6).all()
     assert "Stake" in printed and " XAF " in printed
+
+
+@pytest.mark.usefixtures("isolated_logging")
+def test_bet_at_on_the_command_line_limits_the_coupon_to_those_books(
+    tmp_path: Path, artifacts: dict[str, Path], capsys: pytest.CaptureFixture[str]
+) -> None:
+    args = [
+        *real_inputs(tmp_path, artifacts), *common(tmp_path, artifacts),
+        "--reference-bookmaker", "sim_sharp", "--weight", "0", "--bet-at", "SIM_SOFT",
+    ]  # fmt: skip
+    assert main(args) == 0
+    printed = capsys.readouterr().out
+    assert "(sim_sharp)" not in printed  # the reference book is never recommended
+    record = pd.read_csv(next((tmp_path / "out").glob("bets_*.csv")))
+    assert record["bookmaker"].isin(["sim_soft"]).all()
+    if len(record):
+        assert (record["reference_source"] == "reference book").all()
+    again = [*args[:-1], "betpawa"]  # a book that is not in the odds file
+    assert main(again) == 0
+    assert "No prices from betpawa" in capsys.readouterr().out
 
 
 @pytest.mark.usefixtures("isolated_logging")

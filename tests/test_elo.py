@@ -161,3 +161,66 @@ def test_one_row_per_match() -> None:
     ]
     assert len(result) == 5
     assert result["elo_win_prob_home"].between(0, 1).all()
+
+
+# --------------------------------------------------------------------------- #
+# Matches not played yet
+# --------------------------------------------------------------------------- #
+def fixture(
+    match_id: str,
+    date: str,
+    home: str,
+    away: str,
+    *,
+    league: str = "E0",
+    season: int = 2024,
+) -> dict[str, object]:
+    """A match still to be played: no score."""
+    return {
+        **match(match_id, date, home, away, 0, 0, league=league, season=season),
+        "home_goals": float("nan"),
+        "away_goals": float("nan"),
+    }
+
+
+def test_a_match_without_a_score_is_rated_but_moves_nobody() -> None:
+    played = [
+        match("m1", "2024-08-10", "a", "b", 3, 0),
+        match("m3", "2024-08-24", "a", "b", 0, 1),
+    ]
+    plain = elo(played)
+    with_fixture = elo([*played, fixture("m2", "2024-08-17", "a", "c")])
+    columns = ["home_elo", "away_elo", "elo_win_prob_home"]
+    # the later match is rated exactly as if the fixture were not in the table
+    assert with_fixture.loc["m3", columns].tolist() == plain.loc["m3", columns].tolist()
+    # the fixture carries the ratings held before it: a after beating b, c untouched
+    assert with_fixture.loc["m2", "home_elo"] == pytest.approx(
+        plain.loc["m3", "home_elo"]
+    )
+    assert with_fixture.loc["m2", "away_elo"] == 1500.0
+    assert with_fixture.notna().all().all()
+
+
+def test_a_fixture_never_changes_a_rating_however_many_there_are() -> None:
+    played = [match("m1", "2024-08-10", "a", "b", 2, 2)]
+    ahead = [fixture(f"f{i}", f"2024-08-{17 + 7 * i:02d}", "a", "b") for i in range(3)]
+    result = elo([*played, *ahead])
+    after_draw = result.loc["f0", ["home_elo", "away_elo"]].tolist()
+    for i in (1, 2):
+        assert result.loc[f"f{i}", ["home_elo", "away_elo"]].tolist() == after_draw
+
+
+def test_a_promoted_club_is_rated_as_a_newcomer_on_its_first_fixture() -> None:
+    result = elo(
+        [
+            match("m1", "2024-08-10", "a", "b", 1, 0, season=2024),
+            fixture("m2", "2025-08-09", "a", "z", season=2025),
+        ]
+    )
+    assert result.loc["m2", "away_elo"] == EloConfig().newcomer
+
+
+def test_a_table_of_fixtures_only_gives_every_club_the_starting_rating() -> None:
+    result = elo([fixture("m1", "2024-08-10", "a", "b")])
+    assert result.loc["m1", ["home_elo", "away_elo"]].tolist() == [1500.0, 1500.0]
+    assert result.loc["m1", "elo_win_prob_home"] == pytest.approx(expected_score(65.0))

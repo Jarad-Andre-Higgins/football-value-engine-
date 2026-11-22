@@ -64,6 +64,10 @@ _PAIRS: Final[dict[str, tuple[str, str]]] = {
     "deep": ("home_deep", "away_deep"),
     "ppda": ("home_ppda", "away_ppda"),
 }
+#: Match columns that hold what happened (goals, xG, shots, ...): empty for a fixture.
+RESULT_COLUMNS: Final[tuple[str, ...]] = tuple(
+    column for pair in _PAIRS.values() for column in pair
+)
 FORM_METRICS: Final[tuple[str, ...]] = (
     *(f"{metric}_{way}" for metric in _PAIRS for way in ("for", "against")),
     "points",
@@ -128,10 +132,11 @@ def _numeric(matches: pd.DataFrame, column: str) -> pd.Series:
 
 
 def _points(home_goals: pd.Series, away_goals: pd.Series, side: str) -> pd.Series:
-    """League points earned by ``side`` (3 win, 1 draw, 0 loss)."""
+    """League points earned by ``side`` (3 win, 1 draw, 0 loss); missing before a result."""
     own, opp = (home_goals, away_goals) if side == "home" else (away_goals, home_goals)
+    points = np.where(own > opp, 3.0, np.where(own == opp, 1.0, 0.0))
     return pd.Series(
-        np.where(own > opp, 3.0, np.where(own == opp, 1.0, 0.0)), index=own.index
+        np.where(own.notna() & opp.notna(), points, np.nan), index=own.index
     )
 
 
@@ -241,13 +246,20 @@ def league_context(matches: pd.DataFrame) -> pd.DataFrame:
         ``league_avg_xg`` (per team per match).
     """
     xg_total = _numeric(matches, "home_xg") + _numeric(matches, "away_xg")
+    home_goals, away_goals = (
+        _numeric(matches, "home_goals"),
+        _numeric(matches, "away_goals"),
+    )
+    played = (
+        home_goals.notna() & away_goals.notna()
+    )  # a fixture to come counts for nothing
     frame = pd.DataFrame(
         {
             "league": matches["league"],
             "date": matches["date"],
-            "n": 1.0,
-            "home_goals": _numeric(matches, "home_goals"),
-            "away_goals": _numeric(matches, "away_goals"),
+            "n": played.astype("float64"),
+            "home_goals": home_goals,
+            "away_goals": away_goals,
             "xg_total": xg_total.fillna(0.0),
             "xg_n": 2.0 * xg_total.notna(),
         }
@@ -283,6 +295,10 @@ def build_features(
     matches: pd.DataFrame, elo_config: EloConfig | None = None
 ) -> pd.DataFrame:
     """Build the leak-free feature table, one row per match.
+
+    Matches without a score are fixtures still to be played. They get features
+    from the played matches before them and empty targets, and they change nothing
+    for any other match (see :func:`src.upcoming.upcoming_features`).
 
     Args:
         matches: The enriched match table (``matches_enriched.parquet``).
@@ -344,8 +360,11 @@ def build_features(
     wide["target_away_goals"] = away_goals
     wide["target_home_xg"] = _numeric(wide, "home_xg")
     wide["target_away_xg"] = _numeric(wide, "away_xg")
-    wide["target_result"] = np.where(
+    result = np.where(
         home_goals > away_goals, "H", np.where(home_goals == away_goals, "D", "A")
+    )
+    wide["target_result"] = pd.Series(result, index=wide.index).where(
+        home_goals.notna() & away_goals.notna()
     )
     return wide.loc[:, [*META_COLUMNS, *feature_columns(), *TARGET_COLUMNS]]
 

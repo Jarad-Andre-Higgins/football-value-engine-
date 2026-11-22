@@ -27,6 +27,10 @@ Usage::
 
     python -m src.coupon --demo
     python -m src.coupon --fixtures upcoming.parquet --odds odds.csv --bankroll 50000
+    python -m src.coupon --fixtures upcoming.parquet --odds odds.csv \\
+        --reference-bookmaker pinnacle --bet-at bet365 betpawa
+
+``python -m src.upcoming`` makes both files for the matches of a day.
 """
 
 from __future__ import annotations
@@ -55,7 +59,7 @@ from src.labels import describe_selection
 from src.leagues import LEAGUES
 from src.logging_config import setup_logging
 from src.markets import fixture_markets, market_set
-from src.value import ValueConfig, find_value_bets
+from src.value import ValueConfig, find_value_bets, reference_from_bookmaker
 
 logger = logging.getLogger("src.coupon")
 
@@ -337,6 +341,7 @@ def make_coupon(
     rho: float,
     config: ValueConfig | None = None,
     reference_bookmaker: str | None = None,
+    bet_at: Iterable[str] | None = None,
     stake_step: float = 1.0,
     currency: str = "units",
     weight_source: str = "default",
@@ -354,6 +359,9 @@ def make_coupon(
         config: Betting rules; defaults to :class:`~src.value.ValueConfig`.
         reference_bookmaker: Judge every price against this (sharp) bookmaker's
             de-margined prices instead of each bookmaker's own.
+        bet_at: Bookmakers you can bet at. The other bookmakers in ``odds`` are
+            used only as the reference and are never recommended. ``None`` allows
+            them all.
         stake_step: Stakes are rounded down to a multiple of this (0 for none).
         currency: Label for stakes in the text.
         weight_source: Words saying where ``config.model_weight`` came from.
@@ -365,12 +373,19 @@ def make_coupon(
         an empty coupon with notes rather than an error.
 
     Raises:
-        ValueError: If columns are missing, a match id repeats, or ``stake_step``
-            is negative.
+        ValueError: If columns are missing, a match id repeats, ``stake_step``
+            is negative or ``bet_at`` names no bookmaker.
     """
     config = config or ValueConfig()
     if stake_step < 0.0:
         raise ValueError(f"stake_step cannot be negative, got {stake_step}")
+    allowed = (
+        None
+        if bet_at is None
+        else {name.strip().lower() for name in bet_at if name.strip()}
+    )
+    if allowed is not None and not allowed:
+        raise ValueError("bet_at names no bookmaker")
     missing = [
         c for c in ("match_id", "lam_home", "lam_away") if c not in fixtures.columns
     ]
@@ -420,7 +435,23 @@ def make_coupon(
             "each bookmaker is judged by its own prices"
         )
         reference = None
+    if allowed is not None:
+        absent = sorted(allowed - set(clean["bookmaker"]))
+        if absent:
+            notes.append(f"No prices from {', '.join(absent)}")
+        if reference is not None:
+            # the reference book's view is kept, its own prices are not for sale
+            offers = offers.assign(
+                p_reference=reference_from_bookmaker(offers, reference)
+            )
+        offers = offers[offers["bookmaker"].isin(allowed)].reset_index(drop=True)
+        if offers.empty:
+            return finish(_no_bets(), offers)
     result = find_value_bets(offers, config, reference_bookmaker=reference)
+    if allowed is not None and reference is not None:
+        result["reference_source"] = result["reference_source"].replace(
+            {"supplied": "reference book"}
+        )
     result = round_stakes(result, config.bankroll, stake_step)
     bets = _present(result[result["status"] == "bet"], fixtures, config)
     return finish(bets, result)
@@ -658,6 +689,13 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     rules.add_argument(
         "--reference-bookmaker", help="a sharp bookmaker to judge prices by"
     )
+    rules.add_argument(
+        "--bet-at",
+        nargs="+",
+        metavar="BOOKMAKER",
+        help="bet only at these bookmakers; the others in the odds file serve as "
+        "the reference and are never recommended",
+    )
     parser.add_argument("--output-dir", type=Path, default=COUPON_DIR)
     args = parser.parse_args(argv)
     if args.demo and (args.fixtures or args.odds):
@@ -739,6 +777,7 @@ def main(argv: list[str] | None = None) -> int:
             rho=rho,
             config=config,
             reference_bookmaker=reference,
+            bet_at=args.bet_at,
             stake_step=args.stake_step,
             currency=args.currency,
             weight_source=weight_source,

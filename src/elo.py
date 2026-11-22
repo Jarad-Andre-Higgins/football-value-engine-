@@ -64,7 +64,8 @@ def compute_elo(matches: pd.DataFrame, config: EloConfig | None = None) -> pd.Da
     Returns:
         One row per match with ``match_id``, ``home_elo`` and ``away_elo`` (both
         before the match) and ``elo_win_prob_home`` (the home expected score,
-        including home advantage).
+        including home advantage). A match without a score has not been played:
+        it gets the ratings held before it and changes nobody's rating.
     """
     config = config or EloConfig()
     ordered = matches.sort_values(["date", "match_id"], kind="stable")
@@ -88,6 +89,9 @@ def compute_elo(matches: pd.DataFrame, config: EloConfig | None = None) -> pd.Da
 
         expected = expected_score(home + config.home_advantage - away)
         rows.append((match.match_id, home, away, expected))
+
+        if pd.isna(match.home_goals) or pd.isna(match.away_goals):
+            continue  # not played yet: its ratings are recorded, none move
 
         goal_difference = int(match.home_goals) - int(match.away_goals)
         actual = 1.0 if goal_difference > 0 else 0.5 if goal_difference == 0 else 0.0
